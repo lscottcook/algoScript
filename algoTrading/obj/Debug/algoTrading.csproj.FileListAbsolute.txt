@@ -1,0 +1,12 @@
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.csproj.AssemblyReference.cache
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.AssemblyInfoInputs.cache
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.AssemblyInfo.cs
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.csproj.CoreCompileInputs.cache
+C:\Quantower\Settings\Scripts\Strategies\algoTrading\algoTrading.deps.json
+C:\Quantower\Settings\Scripts\Strategies\algoTrading\algoTrading.dll
+C:\Quantower\Settings\Scripts\Strategies\algoTrading\algoTrading.pdb
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.dll
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\refint\algoTrading.dll
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\algoTrading.pdb
+C:\Users\Lisa\Documents\algoScript\algoTrading\obj\Debug\ref\algoTrading.dll
