@@ -74,8 +74,15 @@ namespace algoTrading
         private const int ServerTakeProfitTicks = 5;
         private const int ServerStopLossTicks = 4;
 
-        // private string CsvPath = @"C:\Users\Administrator\Downloads\algoTrading.csv";
-        private string CsvPath = @"C:\Users\Lisa\Downloads\algoTrading.csv";
+        // Resolved from the CURRENT user's profile rather than hardcoded, so the same
+        // source file works unchanged on both machines:
+        //     local -> C:\Users\Lisa\Downloads\algoTrading.csv
+        //     VPS   -> C:\Users\Administrator\Downloads\algoTrading.csv
+        // Hand-editing this line on the VPS after every pull was what left the working
+        // tree dirty and made the next pull conflict. Nothing to change per machine now.
+        private string CsvPath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+            "Downloads", "algoTrading.csv");
 
         // ======================================================
         // FRAMEWORK FIELDS — quotes / market state
