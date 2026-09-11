@@ -112,6 +112,13 @@ namespace algoTrading
         protected Side? _pendingSignalSide = null;
         protected DateTime _pendingSignalTime = DateTime.MinValue;
 
+        // Direction of the most recent crossover, latched. Unlike _pendingSignalSide
+        // -- which PlaceEntry consumes (sets to null) the instant an order goes out --
+        // this is NOT cleared by order placement, expiry, or a position closing. It
+        // tracks the crossover EVENT, so one crossover can arm exactly one entry.
+        // Only the opposite crossover changes it. See UpdateEntrySignal.
+        private Side? _lastCrossoverSide = null;
+
         // ======================================================
         // STRATEGY-SPECIFIC FIELDS — HMA crossover signal
         // ======================================================
@@ -520,21 +527,41 @@ namespace algoTrading
             if (_pendingSignalSide != null && HmaSignalExpirySeconds > 0
                 && (DateTime.Now - _pendingSignalTime).TotalSeconds > HmaSignalExpirySeconds)
             {
-                Log($"⌛ HMA signal expired — {_pendingSignalSide} unfilled for {HmaSignalExpirySeconds}s", StrategyLoggingLevel.Info);
+                Log($"⌛ HMA signal expired — {_pendingSignalSide} unfilled for {HmaSignalExpirySeconds}s; " +
+                    "this crossover is spent, waiting for the next one", StrategyLoggingLevel.Info);
                 _pendingSignalSide = null;
             }
 
             bool crossedUp = fast2 < slow2 && fast1 > slow1;
             bool crossedDown = fast2 > slow2 && fast1 < slow1;
 
-            if (crossedUp && _pendingSignalSide != Side.Buy)
+            // ONE POSITION PER CROSSOVER.
+            //
+            // crossedUp/crossedDown are derived from bars at shift 1 and 2 -- the last
+            // two CLOSED bars -- so they do not change while the current bar is still
+            // forming. A crossover condition therefore reads TRUE on every quote for
+            // the whole of the following bar (30 seconds at SECOND30, which can be
+            // hundreds of quotes).
+            //
+            // Latching on _pendingSignalSide did not hold, because PlaceEntry sets it
+            // back to null the moment the order goes out: the very next quote saw
+            // "crossedUp && _pendingSignalSide != Side.Buy" as true again and re-armed
+            // the SAME crossover. With a 3s entry timeout and a 4-tick stop, one
+            // crossover could open several positions in a row.
+            //
+            // _lastCrossoverSide is never touched by order placement, so it survives
+            // that consumption and the same crossover cannot arm twice. Only the
+            // opposite crossover flips it.
+            if (crossedUp && _lastCrossoverSide != Side.Buy)
             {
+                _lastCrossoverSide = Side.Buy;
                 _pendingSignalSide = Side.Buy;
                 _pendingSignalTime = DateTime.Now;
                 Log($"📈 HMA crossover UP  fast={fast1:F5} slow={slow1:F5} — going long with the trend", StrategyLoggingLevel.Info);
             }
-            else if (crossedDown && _pendingSignalSide != Side.Sell)
+            else if (crossedDown && _lastCrossoverSide != Side.Sell)
             {
+                _lastCrossoverSide = Side.Sell;
                 _pendingSignalSide = Side.Sell;
                 _pendingSignalTime = DateTime.Now;
                 Log($"📉 HMA crossover DOWN  fast={fast1:F5} slow={slow1:F5} — going short with the trend", StrategyLoggingLevel.Info);
@@ -590,6 +617,42 @@ namespace algoTrading
         private void PlaceEntry(Side side)
         {
             if (_entrySent) return;
+
+            // AUTHORITATIVE PRE-FLIGHT -- do not place an order on top of live state.
+            //
+            // _hasOpenPosition and _entrySent are strategy-local flags, written by our
+            // own event handlers, and the platform's real state runs AHEAD of them.
+            // The gap that matters: an entry can fill on the exchange before
+            // OnPositionAdded is dispatched to us, and OnEntryTimeout can fire in that
+            // same window, fail to find the not-yet-published position, and release
+            // _entrySent. A quote arriving in between then passes the gate with both
+            // flags false and sends a SECOND entry on top of a fill that is already
+            // landing -- which times out ~3s later and cancels. That is the
+            // "working orders placed and cancelled while a position is open" churn.
+            //
+            // Local flags cannot close that window because they are the thing lagging.
+            // Ask Core directly instead: it is the same source the platform's own
+            // order panel reads from.
+            var livePosition = Core.Instance.Positions
+                .FirstOrDefault(pos => pos.Account.Equals(CurrentAccount) && pos.Symbol.Equals(CurrentSymbol));
+            if (livePosition != null)
+            {
+                GateLog($"position {livePosition.Id} already live — not placing another entry");
+                return;
+            }
+
+            // Once an entry fills, the broker's own take-profit and stop-loss legs are
+            // working orders on this symbol/account, so this check also keeps a new
+            // entry out while a bracket is being held.
+            var workingOrder = Core.Instance.Orders
+                .FirstOrDefault(o => o.Account.Equals(CurrentAccount) && o.Symbol.Equals(CurrentSymbol)
+                                  && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled));
+            if (workingOrder != null)
+            {
+                GateLog($"order {workingOrder.Id} ({workingOrder.Side}, {workingOrder.Status}) still working — not placing another entry");
+                return;
+            }
+
             _entrySent = true;
 
             // TODO: Replace with your entry price logic
