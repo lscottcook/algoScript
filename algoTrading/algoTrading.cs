@@ -48,23 +48,18 @@ namespace algoTrading
         // STRATEGY-SPECIFIC INPUTS
         // ======================================================
 
-        // Entry trigger: HMA crossover, traded WITH the trend (fast crosses above
-        // slow -> buy; fast crosses below slow -> sell). Ported from
-        // vocprep\algo\TestingB and Archive\HMACrossover -- see HMAHelper.
-        [InputParameter("HMA Bar Period", 18)]
-        public Period HmaBarPeriod { get; set; }
+        // Entry trigger: 9/20 EMA crossover on 30-second bars, traded WITH the
+        // trend (fast crosses above slow -> buy; fast crosses below slow -> sell).
+        // See EMAHelper for how the averages are calculated.
 
-        [InputParameter("HMA Fast Period", 19)]
-        public int HmaFastPeriod = 5;
-
-        [InputParameter("HMA Slow Period", 20)]
-        public int HmaSlowPeriod = 15;
+        private Period EmaBarPeriod;
+        private int EmaFastPeriod = 9;
+        private int EmaSlowPeriod = 20;
 
         // How long an unfilled crossover signal stays live before requiring a
         // fresh crossover -- prevents chasing a stale trend indefinitely on
         // repeated timeout/retry cycles. 0 = never expires.
-        [InputParameter("HMA Signal Expiry (seconds, 0=never)", 21)]
-        public int HmaSignalExpirySeconds = 300;
+        private int EmaSignalExpirySeconds = 300;
 
         // The take-profit / stop-loss offsets (in ticks) attached to every entry
         // order and held by the broker. These are the strategy's ONLY exit, and the
@@ -127,15 +122,15 @@ namespace algoTrading
         private Side? _lastCrossoverSide = null;
 
         // ======================================================
-        // STRATEGY-SPECIFIC FIELDS — HMA crossover signal
+        // STRATEGY-SPECIFIC FIELDS — EMA crossover signal
         // ======================================================
 
-        // How far back the bar history is requested from. Four hours of the
-        // configured bar period is ample for a 15-bar slow HMA and keeps the
-        // initial load light.
-        private readonly DateTime _hmaStartPoint = Core.TimeUtils.DateTimeUtcNow.AddHours(-4);
-        private HistoricalData _hdmHma;
-        private HMAHelper _hma;
+        // How far back the bar history is requested from. Four hours of 30-second
+        // bars is ~480 bars -- far more than the 20-bar slow EMA needs to warm up,
+        // and still a light initial load.
+        private readonly DateTime _emaStartPoint = Core.TimeUtils.DateTimeUtcNow.AddHours(-4);
+        private HistoricalData _hdmEma;
+        private EMAHelper _ema;
 
 
         // ======================================================
@@ -143,11 +138,52 @@ namespace algoTrading
         // ======================================================
 
         private long _lastCloseTimestamp = 0;         // Stopwatch ticks — re-entry cooldown gate
+        private long _lastUnmatchedLogTs = 0;          // Stopwatch ticks — throttles the unmatched-position warning
+
+        // ======================================================
+        // FIELDS — trades awaiting their realized result
+        // ======================================================
+        // A closed trade is NOT written the instant the position disappears.
+        //
+        // Position.GrossPnL at PositionRemoved time is the UNREALIZED mark against
+        // the last quote the strategy happened to see, not the price the bracket
+        // actually filled at. On the 2026-09-14 11:20 trade that read $37.50 (3
+        // ticks, matching the recorded MFE of 3.5) when the take-profit had in fact
+        // filled 5 ticks out for $62.50 — the strategy simply had not processed a
+        // quote at the fill price before the position vanished.
+        //
+        // The settled figure arrives separately, on Core.Instance.ClosedPositionAdded.
+        // So PositionRemoved captures everything only the strategy knows (MFE/MAE,
+        // fill latency, the quotes at entry and exit) into a TradeRecord, and the
+        // row is written when the realized result catches up with it.
+        private class TradeRecord
+        {
+            public string PositionId;
+            public Side Side;
+            public double EntryPrice;
+            public DateTime OpenTime;
+            public DateTime CloseTime;
+            public double Mfe, Mae;
+            public double EntryBid, EntryAsk;
+            public double ExitBid, ExitAsk;
+            public double FillLatencySec;
+            public System.Timers.Timer Fallback;
+            public int Written;            // Interlocked flag — exactly one writer
+        }
+
+        private readonly Dictionary<string, TradeRecord> _pendingTrades =
+            new Dictionary<string, TradeRecord>();
+        private readonly object _pendingTradesLock = new object();
+
+        // How long to wait for the broker's realized result before writing the row
+        // from the unrealized figures instead. A trade must never be lost just
+        // because ClosedPositionAdded did not arrive.
+        private const int RealizedPnLTimeoutSeconds = 20;
         private long _signalTimestamp = 0;             // Stopwatch ticks at entry placement
         private DateTime _signalWallTime = DateTime.MinValue;
         private double _fillLatencySec = 0;
 
-        private int EntryTimeoutSeconds = 3;
+        private int EntryTimeoutSeconds = 20;
         private int ReentryCooldownSeconds = 1;
 
         // ======================================================
@@ -193,77 +229,71 @@ namespace algoTrading
         private bool _lastKnownConnected = true;
 
         // ======================================================
-        // HMA HELPER
+        // EMA HELPER
         // ======================================================
-        // Ported verbatim from vocprep\algo\TestingB\TestingB.cs, which in turn
-        // took it from Archive\HMACrossover\HMACrossover.cs, so this strategy's
-        // crossovers are directly comparable with those runs.
+        // Standard exponential moving average over bar closes, with the usual
+        // smoothing constant k = 2 / (period + 1).
         //
-        // KNOWN QUIRK, kept deliberately for parity: the final Hull smoothing step
-        // is a no-op. CalculateHMA ends with GetWMA(sqrtPeriod, shift, rawHMA),
-        // and passing overrideValue makes GetWMA use that same constant for every
-        // bar in its loop -- a weighted average of one repeated value is just that
-        // value, so it returns rawHMA unchanged. The result is therefore
-        // 2*WMA(n/2) - WMA(n), the raw intermediate, NOT a true Hull MA. It is
-        // noisier and crosses more often than a real HMA would. Every other
-        // strategy in the archive runs it this way; see the note at the end of
-        // this session if you want the corrected version instead.
-        private class HMAHelper
+        // An EMA has no natural starting point -- every value depends on the one
+        // before it -- so it is seeded with a simple average of the oldest
+        // `period` bars in the window and then run forward. WarmupMultiplier
+        // extra periods of bars are fed in ahead of the bar actually being read,
+        // so by the time the value at `shift` is produced the seed's weight has
+        // decayed to a negligible fraction and the number matches what a
+        // continuously running EMA would report.
+        //
+        // shift follows the HistoricalData convention: 0 is the bar currently
+        // forming, 1 is the last CLOSED bar, 2 the one before it.
+        private class EMAHelper
         {
             private readonly HistoricalData hdmInd;
             private readonly int fastPeriod;
             private readonly int slowPeriod;
 
-            public HMAHelper(HistoricalData hdmInd, int fastPeriod = 5, int slowPeriod = 15)
+            // Periods of extra history fed in before the value is read. At 5,
+            // the seed retains (1-k)^(5*period) of its weight -- under 0.01% for
+            // any period -- so the result is stable regardless of where the
+            // loaded history happens to begin.
+            private const int WarmupMultiplier = 5;
+
+            public EMAHelper(HistoricalData hdmInd, int fastPeriod = 9, int slowPeriod = 20)
             {
                 this.hdmInd = hdmInd;
                 this.fastPeriod = fastPeriod;
                 this.slowPeriod = slowPeriod;
             }
 
-            public double Fast(int shift = 0) => CalculateHMA(fastPeriod, shift);
+            public double Fast(int shift = 0) => CalculateEMA(fastPeriod, shift);
 
-            public double Slow(int shift = 0) => CalculateHMA(slowPeriod, shift);
+            public double Slow(int shift = 0) => CalculateEMA(slowPeriod, shift);
 
-            private double CalculateHMA(int period, int shift = 0)
+            private double CalculateEMA(int period, int shift = 0)
             {
-                if (hdmInd == null || hdmInd.Count < period + shift)
+                if (hdmInd == null || period < 1 || shift < 0)
                     return double.NaN;
 
-                int halfPeriod = Math.Max(1, period / 2);
-                int sqrtPeriod = Math.Max(1, (int)Math.Sqrt(period));
+                // Oldest bar to start from: the seed window plus the warmup tail,
+                // clamped to whatever history is actually loaded.
+                int oldest = shift + period * (WarmupMultiplier + 1) - 1;
+                if (oldest >= hdmInd.Count)
+                    oldest = hdmInd.Count - 1;
 
-                double wmaFull = GetWMA(period, shift);
-                double wmaHalf = GetWMA(halfPeriod, shift);
-
-                double rawHMA = 2 * wmaHalf - wmaFull;
-
-                return GetWMA(sqrtPeriod, shift, rawHMA);
-            }
-
-            private double GetWMA(int length, int shift = 0, double? overrideValue = null)
-            {
-                if (hdmInd == null || hdmInd.Count <= shift + length - 1)
+                // Not even enough bars for the seed itself.
+                if (oldest < shift + period - 1)
                     return double.NaN;
 
-                double sumWeights = 0;
-                double weightedPrice = 0;
-                int weight = length;
+                double seed = 0;
+                for (int i = 0; i < period; i++)
+                    seed += hdmInd.Close(oldest - i);
+                double ema = seed / period;
 
-                for (int i = 0; i < length; i++)
-                {
-                    int barIndex = shift + (length - 1 - i);
-                    if (barIndex < 0 || barIndex >= hdmInd.Count)
-                        return double.NaN;
+                double k = 2.0 / (period + 1);
 
-                    double price = overrideValue ?? hdmInd.Close(barIndex);
+                // Walk forward in time -- indices count DOWN toward the present.
+                for (int barIndex = oldest - period; barIndex >= shift; barIndex--)
+                    ema = hdmInd.Close(barIndex) * k + ema * (1 - k);
 
-                    weightedPrice += price * weight;
-                    sumWeights += weight;
-                    weight--;
-                }
-
-                return (sumWeights == 0) ? double.NaN : weightedPrice / sumWeights;
+                return ema;
             }
         }
 
@@ -286,7 +316,7 @@ namespace algoTrading
         {
             Name = "algoTrading";
             Description = "Generic strategy algoTrading with framework for rapid development.";
-            HmaBarPeriod = Period.SECOND30;
+            EmaBarPeriod = Period.SECOND30;
         }
 
         // ======================================================
@@ -317,14 +347,15 @@ namespace algoTrading
             Log($"🔔 Subscribed to NewLast + NewLevel2 events for {CurrentSymbol.Name}", StrategyLoggingLevel.Info);
             Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved += OnPositionRemoved;
+            Core.Instance.ClosedPositionAdded += OnClosedPositionAdded;
 
-            _hdmHma = CurrentSymbol.GetHistory(new HistoryRequestParameters
+            _hdmEma = CurrentSymbol.GetHistory(new HistoryRequestParameters
             {
                 Symbol = CurrentSymbol,
-                FromTime = _hmaStartPoint,
-                Aggregation = new HistoryAggregationTime(HmaBarPeriod, CurrentSymbol.HistoryType)
+                FromTime = _emaStartPoint,
+                Aggregation = new HistoryAggregationTime(EmaBarPeriod, CurrentSymbol.HistoryType)
             });
-            _hma = new HMAHelper(_hdmHma, HmaFastPeriod, HmaSlowPeriod);
+            _ema = new EMAHelper(_hdmEma, EmaFastPeriod, EmaSlowPeriod);
 
             _tradeCsv = CsvPath;
             EnsureHeaders();
@@ -348,8 +379,29 @@ namespace algoTrading
             Log($"│  Quantity={Quantity}  Server bracket TP={ServerTakeProfitTicks}t  SL={ServerStopLossTicks}t  (attached to the entry order)", StrategyLoggingLevel.Info);
             Log($"│  Trading hours {(UseTradingHours ? "ENABLED" : "DISABLED")}   Account limits {(UseAccountLimit ? $"ENABLED TP=${AccountTakeProfit} SL=${AccountStopLoss}" : "DISABLED")}", StrategyLoggingLevel.Info);
             Log($"│  L1 quotes ENABLED   L2 depth ENABLED (OnNewLevel2 + aggregated DOM pull in OnNewTick)", StrategyLoggingLevel.Info);
-            Log($"│  Entry trigger: HMA crossover ({HmaBarPeriod} bars, fast={HmaFastPeriod} slow={HmaSlowPeriod}), traded WITH the trend  signal expiry={HmaSignalExpirySeconds}s  bars loaded={_hdmHma?.Count ?? 0}", StrategyLoggingLevel.Info);
+            Log($"│  Entry trigger: EMA crossover ({EmaBarPeriod} bars, fast={EmaFastPeriod} slow={EmaSlowPeriod}), traded WITH the trend  signal expiry={EmaSignalExpirySeconds}s  bars loaded={_hdmEma?.Count ?? 0}", StrategyLoggingLevel.Info);
             Log($"│  Trades → {_tradeCsv}", StrategyLoggingLevel.Info);
+
+            // Instrument identity, printed because position matching depends on it.
+            // The strategy is attached to the continuous contract ("HG") while fills
+            // come back on the concrete one ("HGZ6"); IsOurSymbol bridges the two via
+            // Root. If Root is blank here, that bridge cannot work and every fill
+            // will go untracked and unlogged -- exactly the 2026-09-14 failure.
+            Log($"│  Instrument: Name={CurrentSymbol.Name}  Root={(string.IsNullOrEmpty(CurrentSymbol.Root) ? "(none)" : CurrentSymbol.Root)}  " +
+                $"Id={CurrentSymbol.Id}  Exchange={CurrentSymbol.ExchangeId}  Account={CurrentAccount.Name}", StrategyLoggingLevel.Info);
+
+            // Anything already open on this instrument before the strategy started
+            // is reported now; it also proves the matcher works against real broker
+            // objects rather than only against CurrentSymbol.
+            var preExisting = Core.Instance.Positions
+                .Where(pp => IsOurAccount(pp.Account) && IsOurSymbol(pp.Symbol)).ToList();
+            if (preExisting.Count > 0)
+            {
+                foreach (var pp in preExisting)
+                    Log($"│  Pre-existing position matched: {pp.Id} on {pp.Symbol?.Name} " +
+                        $"({pp.Side} {pp.Quantity} @ {pp.OpenPrice:F5}) — not adopted; close it or restart flat",
+                        StrategyLoggingLevel.Error);
+            }
             Log($"╰─ Waiting for quotes…", StrategyLoggingLevel.Info);
         }
 
@@ -365,6 +417,7 @@ namespace algoTrading
             }
             Core.Instance.PositionAdded -= OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved;
+            Core.Instance.ClosedPositionAdded -= OnClosedPositionAdded;
 
             foreach (var kv in _connectionHandlers) kv.Key.StateChanged -= kv.Value;
             _connectionHandlers.Clear();
@@ -375,7 +428,21 @@ namespace algoTrading
             _connectionWatchdog?.Stop(); _connectionWatchdog?.Dispose(); _connectionWatchdog = null;
             _flushTimer?.Stop(); _flushTimer?.Dispose(); _flushTimer = null;
 
-            _hdmHma?.Dispose(); _hdmHma = null; _hma = null;
+            _hdmEma?.Dispose(); _hdmEma = null; _ema = null;
+
+            // Anything still waiting on a realized result is settled now, with the
+            // broker's figure if it has landed, so stopping never discards a trade.
+            List<TradeRecord> stillPending;
+            lock (_pendingTradesLock)
+            {
+                stillPending = _pendingTrades.Values.ToList();
+                _pendingTrades.Clear();
+            }
+            foreach (var record in stillPending)
+            {
+                var closed = FindRealized(record);
+                CompleteTrade(record, closed?.GrossPnL?.Value ?? double.NaN, closed != null);
+            }
 
             Flush();
             Log($"🛑 Strategy stopped.", StrategyLoggingLevel.Info);
@@ -441,7 +508,7 @@ namespace algoTrading
             //    the broker's attached TP/SL is the only thing that closes a trade)
             ManageOpenPositions();
 
-            // 2. Re-evaluate the HMA crossover (cheap; only changes when a bar closes)
+            // 2. Re-evaluate the EMA crossover (cheap; only changes when a bar closes)
             UpdateEntrySignal();
 
             // Everything below decides whether to place a new entry
@@ -476,7 +543,7 @@ namespace algoTrading
                 }
 
                 // Gate 4: Entry signal ready
-                if (_pendingSignalSide == null) { GateLog("no HMA crossover signal"); return; }
+                if (_pendingSignalSide == null) { GateLog("no EMA crossover signal"); return; }
 
                 // Place entry order
                 PlaceEntry(_pendingSignalSide.Value);
@@ -510,7 +577,7 @@ namespace algoTrading
         }
 
         // ======================================================
-        // ENTRY SIGNAL GENERATION — HMA CROSSOVER, TRADED WITH THE TREND
+        // ENTRY SIGNAL GENERATION — 9/20 EMA CROSSOVER, TRADED WITH THE TREND
         // ======================================================
         // Evaluated every tick, but cheap: Fast/Slow only read the last two CLOSED
         // bars (shift 1 and 2), so the result is static within a bar and only
@@ -522,19 +589,19 @@ namespace algoTrading
         // An opposite crossover overwrites a still-pending, unfilled signal
         // outright rather than requiring it to be cancelled first. The signal
         // survives timed-out entry retries (same trend, keep trying) until it
-        // fills, is reversed, or expires via HmaSignalExpirySeconds.
+        // fills, is reversed, or expires via EmaSignalExpirySeconds.
         protected void UpdateEntrySignal()
         {
-            if (_hma == null || _hdmHma == null || _hdmHma.Count < HmaSlowPeriod + 3) return;
+            if (_ema == null || _hdmEma == null || _hdmEma.Count < EmaSlowPeriod + 3) return;
 
-            double fast1 = _hma.Fast(1), slow1 = _hma.Slow(1);
-            double fast2 = _hma.Fast(2), slow2 = _hma.Slow(2);
+            double fast1 = _ema.Fast(1), slow1 = _ema.Slow(1);
+            double fast2 = _ema.Fast(2), slow2 = _ema.Slow(2);
             if (double.IsNaN(fast1) || double.IsNaN(slow1) || double.IsNaN(fast2) || double.IsNaN(slow2)) return;
 
-            if (_pendingSignalSide != null && HmaSignalExpirySeconds > 0
-                && (DateTime.Now - _pendingSignalTime).TotalSeconds > HmaSignalExpirySeconds)
+            if (_pendingSignalSide != null && EmaSignalExpirySeconds > 0
+                && (DateTime.Now - _pendingSignalTime).TotalSeconds > EmaSignalExpirySeconds)
             {
-                Log($"⌛ HMA signal expired — {_pendingSignalSide} unfilled for {HmaSignalExpirySeconds}s; " +
+                Log($"⌛ EMA signal expired — {_pendingSignalSide} unfilled for {EmaSignalExpirySeconds}s; " +
                     "this crossover is spent, waiting for the next one", StrategyLoggingLevel.Info);
                 _pendingSignalSide = null;
             }
@@ -564,15 +631,72 @@ namespace algoTrading
                 _lastCrossoverSide = Side.Buy;
                 _pendingSignalSide = Side.Buy;
                 _pendingSignalTime = DateTime.Now;
-                Log($"📈 HMA crossover UP  fast={fast1:F5} slow={slow1:F5} — going long with the trend", StrategyLoggingLevel.Info);
+                Log($"📈 EMA crossover UP  fast={fast1:F5} slow={slow1:F5} — going long with the trend", StrategyLoggingLevel.Info);
             }
             else if (crossedDown && _lastCrossoverSide != Side.Sell)
             {
                 _lastCrossoverSide = Side.Sell;
                 _pendingSignalSide = Side.Sell;
                 _pendingSignalTime = DateTime.Now;
-                Log($"📉 HMA crossover DOWN  fast={fast1:F5} slow={slow1:F5} — going short with the trend", StrategyLoggingLevel.Info);
+                Log($"📉 EMA crossover DOWN  fast={fast1:F5} slow={slow1:F5} — going short with the trend", StrategyLoggingLevel.Info);
             }
+        }
+
+        // ======================================================
+        // INSTRUMENT / ACCOUNT MATCHING
+        // ======================================================
+        // Does this symbol refer to the instrument the strategy is trading?
+        //
+        // Deliberately NOT a plain Symbol.Equals. The strategy is attached to the
+        // continuous contract ("HG"), but every position and order the broker
+        // sends back is stamped with the CONCRETE contract it actually routed to
+        // ("HGZ6"). Symbol.Equals compares identity, so HGZ6.Equals(HG) is false.
+        //
+        // That one mismatch silently disabled all position tracking: on
+        // 2026-09-14 the strategy placed 34 entries, logged 0 fills and 0 closes,
+        // and wrote 0 CSV rows, while the account was down $200 and the broker's
+        // own order log showed HGZ6 entry fills with market bracket exits.
+        // OnPositionAdded returned at the symbol guard, so _myPositionIds stayed
+        // empty, so OnPositionRemoved returned before it could ever call
+        // WriteTrade. The same mismatch also made the duplicate-entry pre-flight
+        // in PlaceEntry unable to see a live position.
+        private bool IsOurSymbol(Symbol symbol)
+        {
+            if (symbol == null || CurrentSymbol == null) return false;
+
+            if (symbol.Equals(CurrentSymbol)) return true;
+            if (!string.IsNullOrEmpty(symbol.Id)
+                && string.Equals(symbol.Id, CurrentSymbol.Id, StringComparison.OrdinalIgnoreCase))
+                return true;
+
+            // Bridge continuous <-> concrete contract. Root is the contract root
+            // ("HG" for HGZ6); it is empty on non-derivative symbols, where Name
+            // is the right thing to compare instead.
+            string theirRoot = string.IsNullOrEmpty(symbol.Root) ? symbol.Name : symbol.Root;
+            string ourRoot = string.IsNullOrEmpty(CurrentSymbol.Root) ? CurrentSymbol.Name : CurrentSymbol.Root;
+            if (string.IsNullOrEmpty(theirRoot) || string.IsNullOrEmpty(ourRoot)) return false;
+            if (!string.Equals(theirRoot, ourRoot, StringComparison.OrdinalIgnoreCase)) return false;
+
+            // Only bridge when one side IS the root symbol (the continuous one).
+            // Two concrete contracts sharing a root -- HGZ6 and HGH7 -- are
+            // different instruments and must never match each other.
+            bool oneSideIsContinuous =
+                string.Equals(symbol.Name, theirRoot, StringComparison.OrdinalIgnoreCase)
+                || string.Equals(CurrentSymbol.Name, ourRoot, StringComparison.OrdinalIgnoreCase);
+            if (!oneSideIsContinuous) return false;
+
+            // Same root on a different exchange is a different instrument.
+            return string.IsNullOrEmpty(symbol.ExchangeId)
+                || string.IsNullOrEmpty(CurrentSymbol.ExchangeId)
+                || string.Equals(symbol.ExchangeId, CurrentSymbol.ExchangeId, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private bool IsOurAccount(Account account)
+        {
+            if (account == null || CurrentAccount == null) return false;
+            return account.Equals(CurrentAccount)
+                || (!string.IsNullOrEmpty(account.Id)
+                    && string.Equals(account.Id, CurrentAccount.Id, StringComparison.OrdinalIgnoreCase));
         }
 
         private void GateLog(string why)
@@ -641,7 +765,7 @@ namespace algoTrading
             // Ask Core directly instead: it is the same source the platform's own
             // order panel reads from.
             var livePosition = Core.Instance.Positions
-                .FirstOrDefault(pos => pos.Account.Equals(CurrentAccount) && pos.Symbol.Equals(CurrentSymbol));
+                .FirstOrDefault(pos => IsOurAccount(pos.Account) && IsOurSymbol(pos.Symbol));
             if (livePosition != null)
             {
                 GateLog($"position {livePosition.Id} already live — not placing another entry");
@@ -652,7 +776,7 @@ namespace algoTrading
             // working orders on this symbol/account, so this check also keeps a new
             // entry out while a bracket is being held.
             var workingOrder = Core.Instance.Orders
-                .FirstOrDefault(o => o.Account.Equals(CurrentAccount) && o.Symbol.Equals(CurrentSymbol)
+                .FirstOrDefault(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
                                   && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled));
             if (workingOrder != null)
             {
@@ -719,8 +843,8 @@ namespace algoTrading
                         // MUST be released on this path -- _entrySent gates every future
                         // entry in OnNewQuote, and nothing else would ever clear it.
                         var untracked = Core.Instance.Positions
-                            .FirstOrDefault(p => p.Account.Equals(CurrentAccount)
-                                              && p.Symbol.Equals(CurrentSymbol)
+                            .FirstOrDefault(p => IsOurAccount(p.Account)
+                                              && IsOurSymbol(p.Symbol)
                                               && !_myPositionIds.Contains(p.Id));
 
                         _entryLimitOrderId = null;
@@ -788,8 +912,24 @@ namespace algoTrading
         {
             lock (_positionLock)
             {
-                if (!pos.Account.Equals(CurrentAccount)) return;
-                if (!pos.Symbol.Equals(CurrentSymbol)) return;
+                // A position we cannot match is the failure mode that hid every
+                // fill on 2026-09-14, so it is logged rather than dropped in
+                // silence. Throttled, because an unrelated account on the same
+                // platform would otherwise flood the log.
+                if (!IsOurAccount(pos.Account) || !IsOurSymbol(pos.Symbol))
+                {
+                    long nowTs = System.Diagnostics.Stopwatch.GetTimestamp();
+                    double sinceLog = (nowTs - _lastUnmatchedLogTs) / (double)System.Diagnostics.Stopwatch.Frequency;
+                    if (_lastUnmatchedLogTs == 0 || sinceLog >= 60.0)
+                    {
+                        _lastUnmatchedLogTs = nowTs;
+                        Log($"👁 Ignoring position {pos.Id} on {pos.Symbol?.Name}/{pos.Account?.Name} — " +
+                            $"does not match this strategy ({CurrentSymbol?.Name}/{CurrentAccount?.Name}). " +
+                            "If this IS our fill, the instrument match is wrong and no trade will be logged.",
+                            StrategyLoggingLevel.Error);
+                    }
+                    return;
+                }
                 if (_myPositionIds.Contains(pos.Id)) return;
                 if (_hasOpenPosition) return;
 
@@ -852,23 +992,43 @@ namespace algoTrading
                 // OCO-cancels the one that didn't fill when the position goes flat.
                 _myPositionIds.Remove(pos.Id);
 
-                // Only the broker's two bracket legs can close a position now, so the
-                // realized gross result identifies which one filled. A flat/zero gross
-                // is reported as-is rather than guessed at.
-                double gross = pos.GrossPnL?.Value ?? 0;
-                string exitReason = gross > 0 ? "TakeProfit" : gross < 0 ? "StopLoss" : "Flat";
+                // Capture what only the strategy knows. The P&L is deliberately
+                // NOT read from pos here -- see the TradeRecord comment above.
+                var record = new TradeRecord
+                {
+                    PositionId = pos.Id,
+                    Side = pos.Side,
+                    EntryPrice = _entryPrice,
+                    OpenTime = _positionOpenTime,
+                    CloseTime = DateTime.Now,
+                    Mfe = _positionHighWater,
+                    Mae = _positionLowWater,
+                    EntryBid = _entryBidAtFill,
+                    EntryAsk = _entryAskAtFill,
+                    ExitBid = _bid,
+                    ExitAsk = _ask,
+                    FillLatencySec = _fillLatencySec
+                };
 
-                double netPnL = CurrentAccount.Balance - StartingBalance;
-                WriteTrade(pos, netPnL, exitReason);
-
-                Log($"🏁 Closed {pos.Side}  reason={exitReason}  " +
-                    $"Gross={gross:F2}  Net={netPnL:F2}  MFE={_positionHighWater:F1}t MAE={_positionLowWater:F1}t", StrategyLoggingLevel.Info);
-
-                _hasOpenPosition = false;
-                _openPosition = null;
-                _entrySent = false;
-                _entryPrice = double.NaN;
-                _lastCloseTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                // Releasing the trading gate must never depend on the bookkeeping
+                // below succeeding: these flags are the only thing that lets the
+                // strategy trade again, so they are set in a finally.
+                try
+                {
+                    RegisterPendingTrade(record);
+                }
+                catch (Exception ex)
+                {
+                    Log($"❌ Failed to queue closed trade {pos.Id}: {ex.Message}", StrategyLoggingLevel.Error);
+                }
+                finally
+                {
+                    _hasOpenPosition = false;
+                    _openPosition = null;
+                    _entrySent = false;
+                    _entryPrice = double.NaN;
+                    _lastCloseTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
+                }
             }
         }
 
@@ -940,22 +1100,22 @@ namespace algoTrading
                 _loggedLevel2Connected = false;   // re-confirm the L2 feed came back
                 Log($"✅ Reattached symbol + L1/L2 feeds: {CurrentSymbol.Name}", StrategyLoggingLevel.Info);
 
-                _hdmHma?.Dispose();
-                _hdmHma = CurrentSymbol.GetHistory(new HistoryRequestParameters
+                _hdmEma?.Dispose();
+                _hdmEma = CurrentSymbol.GetHistory(new HistoryRequestParameters
                 {
                     Symbol = CurrentSymbol,
-                    FromTime = _hmaStartPoint,
-                    Aggregation = new HistoryAggregationTime(HmaBarPeriod, CurrentSymbol.HistoryType)
+                    FromTime = _emaStartPoint,
+                    Aggregation = new HistoryAggregationTime(EmaBarPeriod, CurrentSymbol.HistoryType)
                 });
-                _hma = new HMAHelper(_hdmHma, HmaFastPeriod, HmaSlowPeriod);
-                Log("✅ HMA history reinitialized after reconnect", StrategyLoggingLevel.Info);
+                _ema = new EMAHelper(_hdmEma, EmaFastPeriod, EmaSlowPeriod);
+                Log("✅ EMA history reinitialized after reconnect", StrategyLoggingLevel.Info);
             }
 
             lock (_positionLock)
             {
                 foreach (var p in Core.Instance.Positions)
                 {
-                    if (_myPositionIds.Contains(p.Id) && p.Account.Equals(CurrentAccount))
+                    if (_myPositionIds.Contains(p.Id) && IsOurAccount(p.Account))
                     {
                         _openPosition = p; _entryPrice = p.OpenPrice; _hasOpenPosition = true;
                         Log($"🔄 Reconnect: re-attached live position {p.Id}", StrategyLoggingLevel.Info);
@@ -965,6 +1125,7 @@ namespace algoTrading
 
             Core.Instance.PositionAdded -= OnPositionAdded; Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved; Core.Instance.PositionRemoved += OnPositionRemoved;
+            Core.Instance.ClosedPositionAdded -= OnClosedPositionAdded; Core.Instance.ClosedPositionAdded += OnClosedPositionAdded;
             Log("✅ Reattached events after reconnect", StrategyLoggingLevel.Info);
         }
 
@@ -987,6 +1148,126 @@ namespace algoTrading
         }
 
         // ======================================================
+        // REALIZED TRADE RESULT
+        // ======================================================
+        // The broker's settled figure for a closed position. This is the only
+        // number that belongs in the CSV; see TradeRecord for why the one on
+        // Position is not it.
+
+        // Does this settled record belong to the given trade?
+        //
+        // Id is the primary key, but ClosedPosition.Id is vendor-supplied and is
+        // not guaranteed to be the same string as Position.Id on every connection.
+        // The strategy holds at most one position at a time, so side plus entry
+        // price on our own instrument identifies the trade unambiguously when the
+        // ids do not line up.
+        private bool IsSameTrade(ClosedPosition closed, TradeRecord record)
+        {
+            if (closed == null || record == null) return false;
+            if (!string.IsNullOrEmpty(closed.Id) && closed.Id == record.PositionId) return true;
+
+            return IsOurSymbol(closed.Symbol)
+                && closed.Side == record.Side
+                && !double.IsNaN(record.EntryPrice)
+                && Math.Abs(closed.OpenPrice - record.EntryPrice) < (_tickSize > 0 ? _tickSize / 2 : 1e-9);
+        }
+
+        private ClosedPosition FindRealized(TradeRecord record) =>
+            Core.Instance.ClosedPositions.FirstOrDefault(cp => IsSameTrade(cp, record));
+
+        private void RegisterPendingTrade(TradeRecord record)
+        {
+            // The realized record can beat PositionRemoved to us, in which case it
+            // is already sitting in Core.Instance.ClosedPositions and there is
+            // nothing to wait for.
+            var alreadyClosed = FindRealized(record);
+            if (alreadyClosed != null)
+            {
+                CompleteTrade(record, alreadyClosed.GrossPnL?.Value ?? 0, true);
+                return;
+            }
+
+            lock (_pendingTradesLock) { _pendingTrades[record.PositionId] = record; }
+
+            // Never let a trade go unrecorded because the realized result never
+            // showed up -- write it from the unrealized figures instead and say so.
+            var fallback = new System.Timers.Timer(RealizedPnLTimeoutSeconds * 1000) { AutoReset = false };
+            fallback.Elapsed += (s2, e2) =>
+            {
+                TradeRecord pending;
+                lock (_pendingTradesLock)
+                {
+                    if (!_pendingTrades.TryGetValue(record.PositionId, out pending)) return;
+                    _pendingTrades.Remove(record.PositionId);
+                }
+
+                var late = FindRealized(pending);
+                if (late != null)
+                {
+                    CompleteTrade(pending, late.GrossPnL?.Value ?? 0, true);
+                    return;
+                }
+
+                Log($"⚠️ No realized result for position {pending.PositionId} after " +
+                    $"{RealizedPnLTimeoutSeconds}s — recording it with an unknown P&L rather than dropping it",
+                    StrategyLoggingLevel.Error);
+                CompleteTrade(pending, double.NaN, false);
+            };
+            record.Fallback = fallback;
+            fallback.Start();
+        }
+
+        private void OnClosedPositionAdded(ClosedPosition closed)
+        {
+            if (closed == null) return;
+
+            TradeRecord record;
+            lock (_pendingTradesLock)
+            {
+                if (!_pendingTrades.TryGetValue(closed.Id, out record))
+                {
+                    record = _pendingTrades.Values.FirstOrDefault(r => IsSameTrade(closed, r));
+                    if (record == null) return;   // someone else's position
+                }
+                _pendingTrades.Remove(record.PositionId);
+            }
+
+            CompleteTrade(record, closed.GrossPnL?.Value ?? 0, true);
+        }
+
+        // Writes the row. Interlocked so the fallback timer and the event can race
+        // without ever producing two rows for one trade.
+        private void CompleteTrade(TradeRecord record, double grossPnL, bool realized)
+        {
+            if (record == null) return;
+            if (System.Threading.Interlocked.Exchange(ref record.Written, 1) != 0) return;
+
+            record.Fallback?.Stop();
+            record.Fallback?.Dispose();
+            record.Fallback = null;
+
+            // Both bracket legs belong to the broker, so the sign of the settled
+            // result identifies which one filled.
+            string exitReason = double.IsNaN(grossPnL) ? "Unknown"
+                : grossPnL > 0 ? "TakeProfit"
+                : grossPnL < 0 ? "StopLoss" : "Flat";
+
+            try
+            {
+                WriteTrade(record, grossPnL, exitReason);
+
+                Log($"🏁 Closed {record.Side}  reason={exitReason}  " +
+                    $"Gross={(double.IsNaN(grossPnL) ? "n/a" : grossPnL.ToString("F2"))}" +
+                    $"{(realized ? "" : " (UNREALIZED — broker result never arrived)")}  " +
+                    $"MFE={record.Mfe:F1}t MAE={record.Mae:F1}t", StrategyLoggingLevel.Info);
+            }
+            catch (Exception ex)
+            {
+                Log($"❌ Failed to record closed trade {record.PositionId}: {ex.Message}", StrategyLoggingLevel.Error);
+            }
+        }
+
+        // ======================================================
         // CSV LOGGING
         // ======================================================
         // TODO: Add strategy-specific columns to EnsureHeaders and WriteTrade
@@ -994,52 +1275,98 @@ namespace algoTrading
         //   EnsureHeaders: add "indicatorValue,entrySignal,exitSignal" etc.
         //   WriteTrade: add string.Format values for those fields
 
+        private const string CsvHeader =
+            "openTime,closeTime,side,entryPrice,exitReason,mfeTicks,maeTicks," +
+            "grossPnL,fillLatencyMs,entryBid,entryAsk,spreadAtFillTicks," +
+            "exitBid,exitAsk";
+
         private void EnsureHeaders()
         {
             try
             {
+                // The path is derived from the running user's profile, so the folder
+                // is not guaranteed to exist -- create it rather than let every
+                // append fail against a missing directory for the whole session.
+                string dir = Path.GetDirectoryName(_tradeCsv);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+
                 if (!File.Exists(_tradeCsv) || new FileInfo(_tradeCsv).Length == 0)
-                    File.AppendAllText(_tradeCsv,
-                        "openTime,closeTime,side,entryPrice,exitReason,mfeTicks,maeTicks," +
-                        "grossPnL,netPnL,fillLatencyMs,entryBid,entryAsk,spreadAtFillTicks," +
-                        "exitBid,exitAsk" + Environment.NewLine);
+                {
+                    File.AppendAllText(_tradeCsv, CsvHeader + Environment.NewLine);
+                    return;
+                }
+
+                // A file written against a different column set would take new rows
+                // silently misaligned. Archive it and start a clean one.
+                string firstLine = File.ReadLines(_tradeCsv).FirstOrDefault();
+                if (!string.Equals(firstLine, CsvHeader, StringComparison.Ordinal))
+                {
+                    string archived = Path.Combine(
+                        Path.GetDirectoryName(_tradeCsv) ?? "",
+                        Path.GetFileNameWithoutExtension(_tradeCsv)
+                            + DateTime.Now.ToString("-yyyyMMdd-HHmmss") + ".csv");
+                    File.Move(_tradeCsv, archived);
+                    File.AppendAllText(_tradeCsv, CsvHeader + Environment.NewLine);
+                    Log($"📁 CSV columns changed — previous file archived to {archived}", StrategyLoggingLevel.Info);
+                }
             }
-            catch (Exception ex) { Log($"CSV header error: {ex.Message}", StrategyLoggingLevel.Error); }
+            catch (Exception ex) { Log($"❌ CSV header error: {ex.Message}", StrategyLoggingLevel.Error); }
         }
 
-        private void WriteTrade(Position pos, double netPnL, string exitReason)
+        private void WriteTrade(TradeRecord record, double grossPnL, string exitReason)
         {
             string row = string.Join(",",
-                _positionOpenTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                pos.Side,
-                _entryPrice.ToString("F5"),
+                record.OpenTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                record.CloseTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
+                record.Side,
+                record.EntryPrice.ToString("F5"),
                 string.IsNullOrEmpty(exitReason) ? "unknown" : exitReason,
-                _positionHighWater.ToString("F1"),
-                _positionLowWater.ToString("F1"),
-                (pos.GrossPnL?.Value ?? 0).ToString("F2"),
-                netPnL.ToString("F2"),
-                (_fillLatencySec * 1000).ToString("F0"),
-                (double.IsNaN(_entryBidAtFill) ? "" : _entryBidAtFill.ToString("F5")),
-                (double.IsNaN(_entryAskAtFill) ? "" : _entryAskAtFill.ToString("F5")),
-                (double.IsNaN(_entryBidAtFill) ? "" : ((_entryAskAtFill - _entryBidAtFill) / _tickSize).ToString("F2")),
-                (double.IsNaN(_bid) ? "" : _bid.ToString("F5")),
-                (double.IsNaN(_ask) ? "" : _ask.ToString("F5")));
+                record.Mfe.ToString("F1"),
+                record.Mae.ToString("F1"),
+                (double.IsNaN(grossPnL) ? "" : grossPnL.ToString("F2")),
+                (record.FillLatencySec * 1000).ToString("F0"),
+                (double.IsNaN(record.EntryBid) ? "" : record.EntryBid.ToString("F5")),
+                (double.IsNaN(record.EntryAsk) ? "" : record.EntryAsk.ToString("F5")),
+                (double.IsNaN(record.EntryBid) || _tickSize <= 0
+                    ? "" : ((record.EntryAsk - record.EntryBid) / _tickSize).ToString("F2")),
+                (double.IsNaN(record.ExitBid) ? "" : record.ExitBid.ToString("F5")),
+                (double.IsNaN(record.ExitAsk) ? "" : record.ExitAsk.ToString("F5")));
+
             lock (_csvLock) { _tradeBuf.Add(row); }
+
+            // Write through now rather than waiting up to 5s for the timer -- a
+            // closed trade should be on disk before the next one opens.
+            Flush();
         }
 
         private void Flush()
         {
+            List<string> trades;
+            lock (_csvLock)
+            {
+                if (_tradeBuf.Count == 0) return;
+                trades = new List<string>(_tradeBuf);
+            }
+
             try
             {
-                List<string> trades = null;
-                lock (_csvLock)
-                {
-                    if (_tradeBuf.Count > 0) { trades = new List<string>(_tradeBuf); _tradeBuf.Clear(); }
-                }
-                if (trades != null) File.AppendAllLines(_tradeCsv, trades);
+                File.AppendAllLines(_tradeCsv, trades);
             }
-            catch (Exception ex) { Log($"CSV flush error: {ex.Message}", StrategyLoggingLevel.Error); }
+            catch (Exception ex)
+            {
+                // The buffer is deliberately NOT cleared on failure. It used to be
+                // cleared before the write was attempted, so a locked or missing
+                // file destroyed the rows outright and the only trace was a log
+                // line. Leaving them queued means the next flush -- or OnStop --
+                // still gets them to disk once the file is writable again.
+                Log($"❌ CSV flush error (rows kept for retry): {ex.Message}", StrategyLoggingLevel.Error);
+                return;
+            }
+
+            // Only drop what was actually written; anything WriteTrade appended
+            // while the file I/O was in flight stays queued for the next flush.
+            lock (_csvLock) { _tradeBuf.RemoveRange(0, Math.Min(trades.Count, _tradeBuf.Count)); }
         }
 
 
@@ -1058,8 +1385,8 @@ namespace algoTrading
             // NY open/close bursts where spreads/fills are most active.
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 9, 45, 12, 30),   // 9:30–10:30 ET
-                //(15, 30, 16,  0),   // 3:30–4:00 ET (optional second window)
+                ( 18, 00, 8, 30),  
+                (8, 30, 16,  0),   // 3:30–4:00 ET (optional second window)
             };
             foreach (var (sh, sm, eh, em) in windows)
             {
