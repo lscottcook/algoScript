@@ -140,27 +140,39 @@ namespace algoTrading
         private long _lastCloseTimestamp = 0;         // Stopwatch ticks — re-entry cooldown gate
         private long _lastUnmatchedLogTs = 0;          // Stopwatch ticks — throttles the unmatched-position warning
 
+        // Bracket leg order ids for the CURRENTLY open position, captured while it
+        // still exposes them. Used to identify its closing execution exactly.
+        private string _tpOrderId, _slOrderId;
+        // The entry order id of the currently open position, for the same reason.
+        private string _entryOrderIdForPosition;
+
         // ======================================================
-        // FIELDS — trades awaiting their realized result
+        // FIELDS — trades awaiting their closing execution
         // ======================================================
-        // A closed trade is NOT written the instant the position disappears.
+        // A closed trade is NOT written the instant the position disappears,
+        // because at that moment the strategy does not yet know what the exit
+        // filled at -- and the P&L is worthless without it.
         //
-        // Position.GrossPnL at PositionRemoved time is the UNREALIZED mark against
-        // the last quote the strategy happened to see, not the price the bracket
-        // actually filled at. On the 2026-09-14 11:20 trade that read $37.50 (3
-        // ticks, matching the recorded MFE of 3.5) when the take-profit had in fact
-        // filled 5 ticks out for $62.50 — the strategy simply had not processed a
-        // quote at the fill price before the position vanished.
-        //
-        // The settled figure arrives separately, on Core.Instance.ClosedPositionAdded.
-        // So PositionRemoved captures everything only the strategy knows (MFE/MAE,
-        // fill latency, the quotes at entry and exit) into a TradeRecord, and the
-        // row is written when the realized result catches up with it.
+        // PositionRemoved captures everything only the strategy knows (MFE/MAE,
+        // fill latency, the quotes at entry and exit) into a TradeRecord. The
+        // closing execution supplies the exit price, and the row is written once
+        // the two meet. See the REALIZED TRADE RESULT section for the P&L itself
+        // and for the two approaches that failed before this one.
         private class TradeRecord
         {
             public string PositionId;
             public Side Side;
-            public double EntryPrice;
+            public double EntryPrice;      // Position.OpenPrice -- fallback only
+            public double Quantity;
+
+            // Order ids are the only truly discriminating link between this trade
+            // and its executions. PositionId is NOT: on this connection it is the
+            // composite "HGZ6@COMEX@Paper200062", identical for every position on
+            // the instrument, which is what let one execution be claimed by nine
+            // different trades.
+            public string EntryOrderId;
+            public string TpOrderId;
+            public string SlOrderId;
             public DateTime OpenTime;
             public DateTime CloseTime;
             public double Mfe, Mae;
@@ -169,21 +181,34 @@ namespace algoTrading
             public double FillLatencySec;
             public System.Timers.Timer Fallback;
             public int Written;            // Interlocked flag — exactly one writer
+
+            // Executions accumulate here; a leg can fill in pieces, so each side is
+            // the quantity-weighted average of what actually traded.
+            public double EntryQty, EntryNotional;
+            public double ExitQty, ExitNotional;
+
+            public double EntryFill => EntryQty > 0 ? EntryNotional / EntryQty : double.NaN;
+            public double ExitPrice => ExitQty > 0 ? ExitNotional / ExitQty : double.NaN;
+            public bool ExitComplete => ExitQty > 0 && ExitQty >= Quantity - 1e-9;
+
+            // Which bracket leg filled, when the order id identified it outright.
+            public string ExitLeg;
         }
 
         private readonly Dictionary<string, TradeRecord> _pendingTrades =
             new Dictionary<string, TradeRecord>();
         private readonly object _pendingTradesLock = new object();
 
-        // How long to wait for the broker's realized result before writing the row
-        // from the unrealized figures instead. A trade must never be lost just
-        // because ClosedPositionAdded did not arrive.
+        // How long to wait for the closing execution before writing the row with
+        // an unknown P&L instead. A trade must never be lost just because an
+        // execution failed to arrive -- an empty grossPnL column is a visible
+        // gap, where a dropped row is not.
         private const int RealizedPnLTimeoutSeconds = 20;
         private long _signalTimestamp = 0;             // Stopwatch ticks at entry placement
         private DateTime _signalWallTime = DateTime.MinValue;
         private double _fillLatencySec = 0;
 
-        private int EntryTimeoutSeconds = 20;
+        private int EntryTimeoutSeconds = 200;
         private int ReentryCooldownSeconds = 1;
 
         // ======================================================
@@ -347,7 +372,7 @@ namespace algoTrading
             Log($"🔔 Subscribed to NewLast + NewLevel2 events for {CurrentSymbol.Name}", StrategyLoggingLevel.Info);
             Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved += OnPositionRemoved;
-            Core.Instance.ClosedPositionAdded += OnClosedPositionAdded;
+            Core.Instance.TradeAdded += OnTradeAdded;
 
             _hdmEma = CurrentSymbol.GetHistory(new HistoryRequestParameters
             {
@@ -417,7 +442,7 @@ namespace algoTrading
             }
             Core.Instance.PositionAdded -= OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved;
-            Core.Instance.ClosedPositionAdded -= OnClosedPositionAdded;
+            Core.Instance.TradeAdded -= OnTradeAdded;
 
             foreach (var kv in _connectionHandlers) kv.Key.StateChanged -= kv.Value;
             _connectionHandlers.Clear();
@@ -439,10 +464,7 @@ namespace algoTrading
                 _pendingTrades.Clear();
             }
             foreach (var record in stillPending)
-            {
-                var closed = FindRealized(record);
-                CompleteTrade(record, closed?.GrossPnL?.Value ?? double.NaN, closed != null);
-            }
+                CompleteTrade(record);
 
             Flush();
             Log($"🛑 Strategy stopped.", StrategyLoggingLevel.Info);
@@ -867,6 +889,8 @@ namespace algoTrading
                             _positionOpenTime = DateTime.Now;
                             _positionHighWater = 0; _positionLowWater = 0;
                             _entryBidAtFill = _bid; _entryAskAtFill = _ask;
+                            _tpOrderId = untracked.TakeProfit?.Id;
+                            _slOrderId = untracked.StopLoss?.Id;
 
                             Log($"🔧 Entry timeout — order gone but position {untracked.Id} is live; " +
                                 $"tracking {untracked.Side} @ {_entryPrice:F5}  " +
@@ -956,6 +980,7 @@ namespace algoTrading
                 }
 
                 _entryLimitTimer?.Stop(); _entryLimitTimer?.Dispose(); _entryLimitTimer = null;
+                _entryOrderIdForPosition = _entryLimitOrderId;
                 _entryLimitOrderId = null;
 
                 _openPosition = pos;
@@ -971,6 +996,11 @@ namespace algoTrading
                 _positionOpenTime = DateTime.Now;
                 _positionHighWater = 0; _positionLowWater = 0;
                 _entryBidAtFill = _bid; _entryAskAtFill = _ask;
+
+                // The bracket legs identify the exit execution outright, so their
+                // ids are captured while the position still exposes them.
+                _tpOrderId = pos.TakeProfit?.Id;
+                _slOrderId = pos.StopLoss?.Id;
 
                 Log($"✅ Filled {pos.Side} {pos.Quantity} @ {_entryPrice:F5}  latency={_fillLatencySec * 1000:F0}ms  " +
                     $"server bracket TP={ServerTakeProfitTicks}t SL={ServerStopLossTicks}t", StrategyLoggingLevel.Trading);
@@ -999,6 +1029,10 @@ namespace algoTrading
                     PositionId = pos.Id,
                     Side = pos.Side,
                     EntryPrice = _entryPrice,
+                    Quantity = pos.Quantity > 0 ? pos.Quantity : Quantity,
+                    EntryOrderId = _entryOrderIdForPosition,
+                    TpOrderId = _tpOrderId,
+                    SlOrderId = _slOrderId,
                     OpenTime = _positionOpenTime,
                     CloseTime = DateTime.Now,
                     Mfe = _positionHighWater,
@@ -1125,7 +1159,7 @@ namespace algoTrading
 
             Core.Instance.PositionAdded -= OnPositionAdded; Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved; Core.Instance.PositionRemoved += OnPositionRemoved;
-            Core.Instance.ClosedPositionAdded -= OnClosedPositionAdded; Core.Instance.ClosedPositionAdded += OnClosedPositionAdded;
+            Core.Instance.TradeAdded -= OnTradeAdded; Core.Instance.TradeAdded += OnTradeAdded;
             Log("✅ Reattached events after reconnect", StrategyLoggingLevel.Info);
         }
 
@@ -1150,47 +1184,175 @@ namespace algoTrading
         // ======================================================
         // REALIZED TRADE RESULT
         // ======================================================
-        // The broker's settled figure for a closed position. This is the only
-        // number that belongs in the CSV; see TradeRecord for why the one on
-        // Position is not it.
-
-        // Does this settled record belong to the given trade?
+        // Gross P&L is reconstructed from the executions the trade actually
+        // printed: entry fill, exit fill, quantity, tick value. Nothing here
+        // trusts a vendor-supplied P&L field, because none of them survived
+        // contact with this connection:
         //
-        // Id is the primary key, but ClosedPosition.Id is vendor-supplied and is
-        // not guaranteed to be the same string as Position.Id on every connection.
-        // The strategy holds at most one position at a time, so side plus entry
-        // price on our own instrument identifies the trade unambiguously when the
-        // ids do not line up.
-        private bool IsSameTrade(ClosedPosition closed, TradeRecord record)
-        {
-            if (closed == null || record == null) return false;
-            if (!string.IsNullOrEmpty(closed.Id) && closed.Id == record.PositionId) return true;
+        //   1. Position.GrossPnL at PositionRemoved time is the UNREALIZED mark
+        //      against the last quote the strategy processed -- $37.50 for a
+        //      take-profit that had filled 5 ticks out for $62.50.
+        //   2. Core.Instance.ClosedPositionAdded never fires here, and
+        //      ClosedPositions never holds a matching record, so every trade fell
+        //      through to the timeout and logged an empty P&L.
+        //   3. Matching executions on Trade.PositionId looked right and was worse
+        //      than either: that id is the composite "HGZ6@COMEX@Paper200062",
+        //      the SAME string for every position on the instrument. Combined
+        //      with a buffer that never consumed what it matched, a single
+        //      execution at 6.39050 was claimed by all nine trades of the
+        //      session, so every row implied that one exit price.
+        //
+        // What actually discriminates is the ORDER ID, plus consuming each
+        // execution exactly once. The strategy holds at most one position at a
+        // time, so an unclaimed opposite-side execution after the entry is the
+        // exit even when the ids are unavailable.
 
-            return IsOurSymbol(closed.Symbol)
-                && closed.Side == record.Side
-                && !double.IsNaN(record.EntryPrice)
-                && Math.Abs(closed.OpenPrice - record.EntryPrice) < (_tickSize > 0 ? _tickSize / 2 : 1e-9);
+        // Dollar value of one tick. GetTickCost is the platform's own figure;
+        // the fallback is the standard futures identity, tick size x contract
+        // size, which for HG is 0.0005 x 25,000 = $12.50.
+        private double TickValue(double atPrice)
+        {
+            if (CurrentSymbol == null || _tickSize <= 0) return double.NaN;
+
+            try
+            {
+                double cost = CurrentSymbol.GetTickCost(atPrice);
+                if (!double.IsNaN(cost) && !double.IsInfinity(cost) && cost > 0) return cost;
+            }
+            catch { /* fall through to the identity below */ }
+
+            double lot = CurrentSymbol.LotSize;
+            return lot > 0 ? _tickSize * lot : double.NaN;
         }
 
-        private ClosedPosition FindRealized(TradeRecord record) =>
-            Core.Instance.ClosedPositions.FirstOrDefault(cp => IsSameTrade(cp, record));
+        // One execution on our instrument, in arrival order. Claimed is what stops
+        // a fill being counted toward more than one trade.
+        private class Execution
+        {
+            public string OrderId;
+            public Side Side;
+            public double Price;
+            public double Quantity;
+            public DateTime Seen;
+            public bool Claimed;
+        }
+
+        private readonly List<Execution> _executions = new List<Execution>();
+
+        private void OnTradeAdded(Trade trade)
+        {
+            if (trade == null) return;
+            if (!IsOurAccount(trade.Account) || !IsOurSymbol(trade.Symbol)) return;
+            if (trade.Price <= 0 || trade.Quantity <= 0) return;
+
+            // PositionImpactType is deliberately NOT used as a filter. It is
+            // vendor-populated and an Undefined value would silently discard every
+            // execution -- the failure mode that produced a session of empty P&L.
+            var execution = new Execution
+            {
+                OrderId = trade.OrderId,
+                Side = trade.Side,
+                Price = trade.Price,
+                Quantity = trade.Quantity,
+                Seen = DateTime.Now
+            };
+
+            TradeRecord completed = null;
+
+            lock (_pendingTradesLock)
+            {
+                _executions.Add(execution);
+
+                // Keep the tail bounded; claimed executions are of no further use.
+                _executions.RemoveAll(x => x.Claimed && (DateTime.Now - x.Seen).TotalMinutes > 5);
+                if (_executions.Count > 200) _executions.RemoveRange(0, _executions.Count - 200);
+
+                foreach (var record in _pendingTrades.Values.ToList())
+                {
+                    if (!ApplyExecutions(record)) continue;
+                    if (!record.ExitComplete) continue;
+                    _pendingTrades.Remove(record.PositionId);
+                    completed = record;
+                    break;
+                }
+            }
+
+            Log($"🧾 Execution {execution.Side} {execution.Quantity:F0} @ {execution.Price:F5} " +
+                $"order={execution.OrderId} impact={trade.PositionImpactType}", StrategyLoggingLevel.Trading);
+
+            if (completed != null) CompleteTrade(completed);
+        }
+
+        // Fold every execution this trade can claim into it. Caller holds
+        // _pendingTradesLock. Returns true if anything was claimed.
+        private bool ApplyExecutions(TradeRecord record)
+        {
+            if (record == null) return false;
+            bool claimedAny = false;
+
+            foreach (var execution in _executions)
+            {
+                if (execution.Claimed) continue;
+
+                // --- entry side -------------------------------------------------
+                bool isEntry = !string.IsNullOrEmpty(record.EntryOrderId)
+                            && execution.OrderId == record.EntryOrderId;
+                if (isEntry)
+                {
+                    record.EntryQty += execution.Quantity;
+                    record.EntryNotional += execution.Price * execution.Quantity;
+                    execution.Claimed = true;
+                    claimedAny = true;
+                    continue;
+                }
+
+                if (record.ExitComplete) continue;
+
+                // --- exit side, by bracket leg id (authoritative) ----------------
+                string leg = null;
+                if (!string.IsNullOrEmpty(record.TpOrderId) && execution.OrderId == record.TpOrderId)
+                    leg = "TakeProfit";
+                else if (!string.IsNullOrEmpty(record.SlOrderId) && execution.OrderId == record.SlOrderId)
+                    leg = "StopLoss";
+
+                // --- exit side, by shape (only when no leg id was available) -----
+                // Safe because the strategy holds one position at a time and each
+                // execution is consumed: an unclaimed opposite-side fill that is
+                // not our own entry order can only be this position's exit.
+                bool shapeExit = leg == null
+                              && string.IsNullOrEmpty(record.TpOrderId)
+                              && string.IsNullOrEmpty(record.SlOrderId)
+                              && execution.Side != record.Side
+                              && execution.OrderId != record.EntryOrderId;
+
+                if (leg == null && !shapeExit) continue;
+
+                record.ExitQty += execution.Quantity;
+                record.ExitNotional += execution.Price * execution.Quantity;
+                if (leg != null) record.ExitLeg = leg;
+                execution.Claimed = true;
+                claimedAny = true;
+            }
+
+            return claimedAny;
+        }
 
         private void RegisterPendingTrade(TradeRecord record)
         {
-            // The realized record can beat PositionRemoved to us, in which case it
-            // is already sitting in Core.Instance.ClosedPositions and there is
-            // nothing to wait for.
-            var alreadyClosed = FindRealized(record);
-            if (alreadyClosed != null)
+            bool complete;
+            lock (_pendingTradesLock)
             {
-                CompleteTrade(record, alreadyClosed.GrossPnL?.Value ?? 0, true);
-                return;
+                // The executions that closed this position almost always arrive
+                // BEFORE PositionRemoved -- the fill is what ends the position --
+                // so they are already buffered and waiting to be claimed.
+                ApplyExecutions(record);
+                complete = record.ExitComplete;
+                if (!complete) _pendingTrades[record.PositionId] = record;
             }
 
-            lock (_pendingTradesLock) { _pendingTrades[record.PositionId] = record; }
+            if (complete) { CompleteTrade(record); return; }
 
-            // Never let a trade go unrecorded because the realized result never
-            // showed up -- write it from the unrealized figures instead and say so.
+            // Never let a trade go unrecorded because an execution never arrived.
             var fallback = new System.Timers.Timer(RealizedPnLTimeoutSeconds * 1000) { AutoReset = false };
             fallback.Elapsed += (s2, e2) =>
             {
@@ -1201,43 +1363,18 @@ namespace algoTrading
                     _pendingTrades.Remove(record.PositionId);
                 }
 
-                var late = FindRealized(pending);
-                if (late != null)
-                {
-                    CompleteTrade(pending, late.GrossPnL?.Value ?? 0, true);
-                    return;
-                }
-
-                Log($"⚠️ No realized result for position {pending.PositionId} after " +
+                Log($"⚠️ No closing execution for position {pending.PositionId} after " +
                     $"{RealizedPnLTimeoutSeconds}s — recording it with an unknown P&L rather than dropping it",
                     StrategyLoggingLevel.Error);
-                CompleteTrade(pending, double.NaN, false);
+                CompleteTrade(pending);
             };
             record.Fallback = fallback;
             fallback.Start();
         }
 
-        private void OnClosedPositionAdded(ClosedPosition closed)
-        {
-            if (closed == null) return;
-
-            TradeRecord record;
-            lock (_pendingTradesLock)
-            {
-                if (!_pendingTrades.TryGetValue(closed.Id, out record))
-                {
-                    record = _pendingTrades.Values.FirstOrDefault(r => IsSameTrade(closed, r));
-                    if (record == null) return;   // someone else's position
-                }
-                _pendingTrades.Remove(record.PositionId);
-            }
-
-            CompleteTrade(record, closed.GrossPnL?.Value ?? 0, true);
-        }
-
-        // Writes the row. Interlocked so the fallback timer and the event can race
-        // without ever producing two rows for one trade.
-        private void CompleteTrade(TradeRecord record, double grossPnL, bool realized)
+        // Writes the row. Interlocked so the fallback timer and the execution
+        // stream can race without ever producing two rows for one trade.
+        private void CompleteTrade(TradeRecord record)
         {
             if (record == null) return;
             if (System.Threading.Interlocked.Exchange(ref record.Written, 1) != 0) return;
@@ -1246,19 +1383,41 @@ namespace algoTrading
             record.Fallback?.Dispose();
             record.Fallback = null;
 
-            // Both bracket legs belong to the broker, so the sign of the settled
-            // result identifies which one filled.
-            string exitReason = double.IsNaN(grossPnL) ? "Unknown"
+            // The execution fill is the truth. Position.OpenPrice disagreed with it
+            // by a tick on at least one trade (recorded 6.38900 against an actual
+            // fill of 6.38950), so it is only a fallback.
+            double entryPrice = !double.IsNaN(record.EntryFill) ? record.EntryFill : record.EntryPrice;
+            double exitPrice = record.ExitPrice;
+
+            double grossPnL = double.NaN, ticks = double.NaN, tickValue = double.NaN;
+
+            if (!double.IsNaN(exitPrice) && !double.IsNaN(entryPrice) && _tickSize > 0)
+            {
+                // A long makes money when the exit is higher; a short when it is lower.
+                double direction = record.Side == Side.Buy ? 1.0 : -1.0;
+                ticks = (exitPrice - entryPrice) * direction / _tickSize;
+                tickValue = TickValue(entryPrice);
+                if (!double.IsNaN(tickValue))
+                    grossPnL = ticks * tickValue * record.ExitQty;
+            }
+
+            // Prefer the leg that actually filled; fall back to the sign.
+            string exitReason = !string.IsNullOrEmpty(record.ExitLeg) ? record.ExitLeg
+                : double.IsNaN(grossPnL) ? "Unknown"
                 : grossPnL > 0 ? "TakeProfit"
                 : grossPnL < 0 ? "StopLoss" : "Flat";
 
             try
             {
-                WriteTrade(record, grossPnL, exitReason);
+                WriteTrade(record, entryPrice, grossPnL, exitReason);
 
+                // The inputs are logged with the result so any row in the CSV can
+                // be checked by hand without re-deriving it from the platform log.
                 Log($"🏁 Closed {record.Side}  reason={exitReason}  " +
-                    $"Gross={(double.IsNaN(grossPnL) ? "n/a" : grossPnL.ToString("F2"))}" +
-                    $"{(realized ? "" : " (UNREALIZED — broker result never arrived)")}  " +
+                    $"Gross={(double.IsNaN(grossPnL) ? "n/a" : grossPnL.ToString("F2"))}  " +
+                    $"entry={entryPrice:F5} exit={(double.IsNaN(exitPrice) ? "n/a" : exitPrice.ToString("F5"))} " +
+                    $"({(double.IsNaN(ticks) ? "?" : ticks.ToString("F1"))}t x " +
+                    $"{(double.IsNaN(tickValue) ? "?" : tickValue.ToString("F2"))}/t x {record.ExitQty:F0})  " +
                     $"MFE={record.Mfe:F1}t MAE={record.Mae:F1}t", StrategyLoggingLevel.Info);
             }
             catch (Exception ex)
@@ -1314,13 +1473,13 @@ namespace algoTrading
             catch (Exception ex) { Log($"❌ CSV header error: {ex.Message}", StrategyLoggingLevel.Error); }
         }
 
-        private void WriteTrade(TradeRecord record, double grossPnL, string exitReason)
+        private void WriteTrade(TradeRecord record, double entryPrice, double grossPnL, string exitReason)
         {
             string row = string.Join(",",
                 record.OpenTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                 record.CloseTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
                 record.Side,
-                record.EntryPrice.ToString("F5"),
+                entryPrice.ToString("F5"),
                 string.IsNullOrEmpty(exitReason) ? "unknown" : exitReason,
                 record.Mfe.ToString("F1"),
                 record.Mae.ToString("F1"),
