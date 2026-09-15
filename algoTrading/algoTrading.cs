@@ -4,6 +4,7 @@ using System.Collections.Generic;
 //using System.Data;
 using System.Diagnostics.Metrics;
 using System.Drawing;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Security.Principal;
@@ -132,6 +133,39 @@ namespace algoTrading
         private HistoricalData _hdmEma;
         private EMAHelper _ema;
 
+        // ======================================================
+        // RESEARCH SNAPSHOTS — signal + passive execution
+        // ======================================================
+        // A unique id for every start of the strategy. This makes stop/restart
+        // boundaries explicit in the CSV instead of allowing two runs to look
+        // like one continuous session.
+        private string _strategyRunId = Guid.NewGuid().ToString("N");
+        private DateTime _strategyStartTime = DateTime.MinValue;
+        private long _crossoverSequence = 0;
+
+        private class SignalSnapshot
+        {
+            public string CrossoverId;
+            public DateTime SignalTime;
+            public Side Side;
+            public double Fast1, Slow1, Fast2, Slow2;
+            public double FastSlopeTicks, SlowSlopeTicks, EmaSeparationTicks;
+            public double Bid, Ask;
+            public double BidSize, AskSize, DepthImbalance;
+            public double BarOpen, BarHigh, BarLow, BarClose, BarRangeTicks;
+        }
+
+        private SignalSnapshot _activeSignal = null;
+
+        // Snapshot of the actual passive order submission. These values are kept
+        // until the position closes so signal quality can be separated from
+        // execution quality in the CSV.
+        private DateTime _entrySubmitTime = DateTime.MinValue;
+        private double _entrySubmitPrice = double.NaN;
+        private double _entryBidAtSubmit = double.NaN, _entryAskAtSubmit = double.NaN;
+        private double _entryBidSizeAtSubmit = double.NaN, _entryAskSizeAtSubmit = double.NaN;
+        private double _entryDepthImbalanceAtSubmit = double.NaN;
+        private SignalSnapshot _signalForPosition = null;
 
         // ======================================================
         // FIELDS — entry / signal latency
@@ -179,6 +213,18 @@ namespace algoTrading
             public double EntryBid, EntryAsk;
             public double ExitBid, ExitAsk;
             public double FillLatencySec;
+            public double FastEmaAtFill, SlowEmaAtFill, EmaSeparationAtFillTicks;
+
+            // Research / passive-execution context
+            public string StrategyRunId, CrossoverId;
+            public DateTime StrategyStartTime, SignalTime, SubmitTime;
+            public double SubmitPrice;
+            public double SignalFast1, SignalSlow1, SignalFast2, SignalSlow2;
+            public double FastSlopeTicks, SlowSlopeTicks, EmaSeparationTicks;
+            public double SignalBid, SignalAsk, SignalBidSize, SignalAskSize, SignalDepthImbalance;
+            public double SubmitBid, SubmitAsk, SubmitBidSize, SubmitAskSize, SubmitDepthImbalance;
+            public double FillBidSize, FillAskSize, FillDepthImbalance;
+            public double SignalBarOpen, SignalBarHigh, SignalBarLow, SignalBarClose, SignalBarRangeTicks;
             public System.Timers.Timer Fallback;
             public int Written;            // Interlocked flag — exactly one writer
 
@@ -243,6 +289,8 @@ namespace algoTrading
         private double _positionHighWater = 0;         // MFE (ticks)
         private double _positionLowWater = 0;          // MAE (ticks)
         private double _entryBidAtFill = double.NaN, _entryAskAtFill = double.NaN;
+        private double _fastEmaAtFill = double.NaN, _slowEmaAtFill = double.NaN;
+        private double _emaSeparationAtFillTicks = double.NaN;
 
         // ======================================================
         // FIELDS — connection / reconnect
@@ -382,6 +430,8 @@ namespace algoTrading
             });
             _ema = new EMAHelper(_hdmEma, EmaFastPeriod, EmaSlowPeriod);
 
+            _strategyRunId = Guid.NewGuid().ToString("N");
+            _strategyStartTime = DateTime.Now;
             _tradeCsv = CsvPath;
             EnsureHeaders();
 
@@ -653,6 +703,7 @@ namespace algoTrading
                 _lastCrossoverSide = Side.Buy;
                 _pendingSignalSide = Side.Buy;
                 _pendingSignalTime = DateTime.Now;
+                _activeSignal = CaptureSignalSnapshot(Side.Buy, fast1, slow1, fast2, slow2);
                 Log($"📈 EMA crossover UP  fast={fast1:F5} slow={slow1:F5} — going long with the trend", StrategyLoggingLevel.Info);
             }
             else if (crossedDown && _lastCrossoverSide != Side.Sell)
@@ -660,8 +711,81 @@ namespace algoTrading
                 _lastCrossoverSide = Side.Sell;
                 _pendingSignalSide = Side.Sell;
                 _pendingSignalTime = DateTime.Now;
+                _activeSignal = CaptureSignalSnapshot(Side.Sell, fast1, slow1, fast2, slow2);
                 Log($"📉 EMA crossover DOWN  fast={fast1:F5} slow={slow1:F5} — going short with the trend", StrategyLoggingLevel.Info);
             }
+        }
+
+        private SignalSnapshot CaptureSignalSnapshot(Side side, double fast1, double slow1, double fast2, double slow2)
+        {
+            var snap = new SignalSnapshot
+            {
+                CrossoverId = $"{_strategyRunId}-{System.Threading.Interlocked.Increment(ref _crossoverSequence):D6}",
+                SignalTime = DateTime.Now,
+                Side = side,
+                Fast1 = fast1,
+                Slow1 = slow1,
+                Fast2 = fast2,
+                Slow2 = slow2,
+                FastSlopeTicks = _tickSize > 0 ? (fast1 - fast2) / _tickSize : double.NaN,
+                SlowSlopeTicks = _tickSize > 0 ? (slow1 - slow2) / _tickSize : double.NaN,
+                EmaSeparationTicks = _tickSize > 0 ? (fast1 - slow1) / _tickSize : double.NaN,
+                Bid = _bid,
+                Ask = _ask
+            };
+
+            GetTopBook(out snap.BidSize, out snap.AskSize, out snap.DepthImbalance);
+
+            try
+            {
+                snap.BarOpen = _hdmEma.Open(1);
+                snap.BarHigh = _hdmEma.High(1);
+                snap.BarLow = _hdmEma.Low(1);
+                snap.BarClose = _hdmEma.Close(1);
+                snap.BarRangeTicks = _tickSize > 0 ? (snap.BarHigh - snap.BarLow) / _tickSize : double.NaN;
+            }
+            catch
+            {
+                snap.BarOpen = snap.BarHigh = snap.BarLow = snap.BarClose = snap.BarRangeTicks = double.NaN;
+            }
+            return snap;
+        }
+
+        // Read the first aggregated DOM level without hard-coding Level2Item's
+        // exact size-property name. Quantower builds have exposed Size or Volume
+        // depending on the object/version, so reflection keeps this logger portable.
+        private static double ReadNumericProperty(object obj, params string[] names)
+        {
+            if (obj == null) return double.NaN;
+            foreach (string name in names)
+            {
+                try
+                {
+                    var prop = obj.GetType().GetProperty(name);
+                    if (prop == null) continue;
+                    object value = prop.GetValue(obj);
+                    if (value == null) continue;
+                    return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+                }
+                catch { }
+            }
+            return double.NaN;
+        }
+
+        private void GetTopBook(out double bidSize, out double askSize, out double imbalance)
+        {
+            bidSize = askSize = imbalance = double.NaN;
+            try
+            {
+                var bids = _sortedBids;
+                var asks = _sortedAsks;
+                if (bids == null || asks == null || bids.Count == 0 || asks.Count == 0) return;
+                bidSize = ReadNumericProperty(bids[0], "Size", "Volume", "Quantity");
+                askSize = ReadNumericProperty(asks[0], "Size", "Volume", "Quantity");
+                double total = bidSize + askSize;
+                if (!double.IsNaN(total) && total > 0) imbalance = (bidSize - askSize) / total;
+            }
+            catch { }
         }
 
         // ======================================================
@@ -812,6 +936,12 @@ namespace algoTrading
             // Example: double limitPrice = side == Side.Buy ? _bid : _ask;
             double limitPrice = side == Side.Buy ? _bid : _ask;
 
+            _entrySubmitTime = DateTime.Now;
+            _entrySubmitPrice = limitPrice;
+            _entryBidAtSubmit = _bid;
+            _entryAskAtSubmit = _ask;
+            GetTopBook(out _entryBidSizeAtSubmit, out _entryAskSizeAtSubmit, out _entryDepthImbalanceAtSubmit);
+
             var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
             {
                 Symbol = CurrentSymbol,
@@ -889,6 +1019,8 @@ namespace algoTrading
                             _positionOpenTime = DateTime.Now;
                             _positionHighWater = 0; _positionLowWater = 0;
                             _entryBidAtFill = _bid; _entryAskAtFill = _ask;
+                            _signalForPosition = _activeSignal;
+                            CaptureFillEmaSnapshot();
                             _tpOrderId = untracked.TakeProfit?.Id;
                             _slOrderId = untracked.StopLoss?.Id;
 
@@ -996,6 +1128,8 @@ namespace algoTrading
                 _positionOpenTime = DateTime.Now;
                 _positionHighWater = 0; _positionLowWater = 0;
                 _entryBidAtFill = _bid; _entryAskAtFill = _ask;
+                _signalForPosition = _activeSignal;
+                CaptureFillEmaSnapshot();
 
                 // The bracket legs identify the exit execution outright, so their
                 // ids are captured while the position still exposes them.
@@ -1010,6 +1144,27 @@ namespace algoTrading
 
                 // TODO: Add any additional position-opened logic here
             }
+        }
+
+        // Capture EMA state at the moment the position is observed as filled.
+        // shift 0 includes the currently forming 30-second bar, which is intentional:
+        // these fields answer how far the EMA relationship evolved between the
+        // closed-bar crossover signal and the actual passive fill.
+        private void CaptureFillEmaSnapshot()
+        {
+            _fastEmaAtFill = double.NaN;
+            _slowEmaAtFill = double.NaN;
+            _emaSeparationAtFillTicks = double.NaN;
+
+            try
+            {
+                if (_ema == null || _tickSize <= 0) return;
+                _fastEmaAtFill = _ema.Fast(0);
+                _slowEmaAtFill = _ema.Slow(0);
+                if (!double.IsNaN(_fastEmaAtFill) && !double.IsNaN(_slowEmaAtFill))
+                    _emaSeparationAtFillTicks = (_fastEmaAtFill - _slowEmaAtFill) / _tickSize;
+            }
+            catch { }
         }
 
         private void OnPositionRemoved(Position pos)
@@ -1041,8 +1196,40 @@ namespace algoTrading
                     EntryAsk = _entryAskAtFill,
                     ExitBid = _bid,
                     ExitAsk = _ask,
-                    FillLatencySec = _fillLatencySec
+                    FillLatencySec = _fillLatencySec,
+                    FastEmaAtFill = _fastEmaAtFill,
+                    SlowEmaAtFill = _slowEmaAtFill,
+                    EmaSeparationAtFillTicks = _emaSeparationAtFillTicks,
+                    StrategyRunId = _strategyRunId,
+                    StrategyStartTime = _strategyStartTime,
+                    CrossoverId = _signalForPosition?.CrossoverId ?? "",
+                    SignalTime = _signalForPosition?.SignalTime ?? DateTime.MinValue,
+                    SubmitTime = _entrySubmitTime,
+                    SubmitPrice = _entrySubmitPrice,
+                    SignalFast1 = _signalForPosition?.Fast1 ?? double.NaN,
+                    SignalSlow1 = _signalForPosition?.Slow1 ?? double.NaN,
+                    SignalFast2 = _signalForPosition?.Fast2 ?? double.NaN,
+                    SignalSlow2 = _signalForPosition?.Slow2 ?? double.NaN,
+                    FastSlopeTicks = _signalForPosition?.FastSlopeTicks ?? double.NaN,
+                    SlowSlopeTicks = _signalForPosition?.SlowSlopeTicks ?? double.NaN,
+                    EmaSeparationTicks = _signalForPosition?.EmaSeparationTicks ?? double.NaN,
+                    SignalBid = _signalForPosition?.Bid ?? double.NaN,
+                    SignalAsk = _signalForPosition?.Ask ?? double.NaN,
+                    SignalBidSize = _signalForPosition?.BidSize ?? double.NaN,
+                    SignalAskSize = _signalForPosition?.AskSize ?? double.NaN,
+                    SignalDepthImbalance = _signalForPosition?.DepthImbalance ?? double.NaN,
+                    SubmitBid = _entryBidAtSubmit,
+                    SubmitAsk = _entryAskAtSubmit,
+                    SubmitBidSize = _entryBidSizeAtSubmit,
+                    SubmitAskSize = _entryAskSizeAtSubmit,
+                    SubmitDepthImbalance = _entryDepthImbalanceAtSubmit,
+                    SignalBarOpen = _signalForPosition?.BarOpen ?? double.NaN,
+                    SignalBarHigh = _signalForPosition?.BarHigh ?? double.NaN,
+                    SignalBarLow = _signalForPosition?.BarLow ?? double.NaN,
+                    SignalBarClose = _signalForPosition?.BarClose ?? double.NaN,
+                    SignalBarRangeTicks = _signalForPosition?.BarRangeTicks ?? double.NaN
                 };
+                GetTopBook(out record.FillBidSize, out record.FillAskSize, out record.FillDepthImbalance);
 
                 // Releasing the trading gate must never depend on the bookkeeping
                 // below succeeding: these flags are the only thing that lets the
@@ -1061,6 +1248,7 @@ namespace algoTrading
                     _openPosition = null;
                     _entrySent = false;
                     _entryPrice = double.NaN;
+                    _fastEmaAtFill = _slowEmaAtFill = _emaSeparationAtFillTicks = double.NaN;
                     _lastCloseTimestamp = System.Diagnostics.Stopwatch.GetTimestamp();
                 }
             }
@@ -1435,17 +1623,19 @@ namespace algoTrading
         //   WriteTrade: add string.Format values for those fields
 
         private const string CsvHeader =
-            "openTime,closeTime,side,entryPrice,exitReason,mfeTicks,maeTicks," +
-            "grossPnL,fillLatencyMs,entryBid,entryAsk,spreadAtFillTicks," +
-            "exitBid,exitAsk";
+            "strategyRunId,strategyStartTime,crossoverId,signalTime,orderSubmitTime,openTime,closeTime," +
+            "positionId,entryOrderId,side,quantity," +
+            "signalFastEma,signalSlowEma,previousFastEma,previousSlowEma,fastSlopeTicks,slowSlopeTicks,emaSeparationTicks," +
+            "signalBarOpen,signalBarHigh,signalBarLow,signalBarClose,signalBarRangeTicks," +
+            "signalBid,signalAsk,signalSpreadTicks,signalBidSize,signalAskSize,signalDepthImbalance," +
+            "submitPrice,submitBid,submitAsk,submitSpreadTicks,submitBidSize,submitAskSize,submitDepthImbalance," +
+            "entryPrice,fastEmaAtFill,slowEmaAtFill,emaSeparationAtFillTicks,fillLatencyMs,signalToFillMs,priceMoveSignalToFillTicks,entryBid,entryAsk,spreadAtFillTicks,fillBidSize,fillAskSize,fillDepthImbalance," +
+            "exitPrice,exitReason,mfeTicks,maeTicks,grossPnL,exitBid,exitAsk";
 
         private void EnsureHeaders()
         {
             try
             {
-                // The path is derived from the running user's profile, so the folder
-                // is not guaranteed to exist -- create it rather than let every
-                // append fail against a missing directory for the whole session.
                 string dir = Path.GetDirectoryName(_tradeCsv);
                 if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
                     Directory.CreateDirectory(dir);
@@ -1456,46 +1646,59 @@ namespace algoTrading
                     return;
                 }
 
-                // A file written against a different column set would take new rows
-                // silently misaligned. Archive it and start a clean one.
                 string firstLine = File.ReadLines(_tradeCsv).FirstOrDefault();
                 if (!string.Equals(firstLine, CsvHeader, StringComparison.Ordinal))
                 {
                     string archived = Path.Combine(
                         Path.GetDirectoryName(_tradeCsv) ?? "",
                         Path.GetFileNameWithoutExtension(_tradeCsv)
-                            + DateTime.Now.ToString("-yyyyMMdd-HHmmss") + ".csv");
+                            + DateTime.Now.ToString("-yyyyMMdd-HHmmssfff") + ".csv");
                     File.Move(_tradeCsv, archived);
                     File.AppendAllText(_tradeCsv, CsvHeader + Environment.NewLine);
-                    Log($"📁 CSV columns changed — previous file archived to {archived}", StrategyLoggingLevel.Info);
+                    Log($"📁 CSV schema changed — previous file archived to {archived}", StrategyLoggingLevel.Info);
                 }
             }
             catch (Exception ex) { Log($"❌ CSV header error: {ex.Message}", StrategyLoggingLevel.Error); }
         }
 
+        private static string CsvD(double value, string format = "F5") =>
+            double.IsNaN(value) || double.IsInfinity(value) ? "" : value.ToString(format, CultureInfo.InvariantCulture);
+
+        private static string CsvTime(DateTime value) =>
+            value == DateTime.MinValue ? "" : value.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+
         private void WriteTrade(TradeRecord record, double entryPrice, double grossPnL, string exitReason)
         {
+            double exitPrice = record.ExitPrice;
+            double signalSpread = (!double.IsNaN(record.SignalBid) && !double.IsNaN(record.SignalAsk) && _tickSize > 0)
+                ? (record.SignalAsk - record.SignalBid) / _tickSize : double.NaN;
+            double submitSpread = (!double.IsNaN(record.SubmitBid) && !double.IsNaN(record.SubmitAsk) && _tickSize > 0)
+                ? (record.SubmitAsk - record.SubmitBid) / _tickSize : double.NaN;
+            double fillSpread = (!double.IsNaN(record.EntryBid) && !double.IsNaN(record.EntryAsk) && _tickSize > 0)
+                ? (record.EntryAsk - record.EntryBid) / _tickSize : double.NaN;
+            double signalToFillMs = record.SignalTime != DateTime.MinValue && record.OpenTime != DateTime.MinValue
+                ? (record.OpenTime - record.SignalTime).TotalMilliseconds : double.NaN;
+            double signalReference = record.Side == Side.Buy ? record.SignalBid : record.SignalAsk;
+            double priceMoveSignalToFillTicks = !double.IsNaN(signalReference) && !double.IsNaN(entryPrice) && _tickSize > 0
+                ? (entryPrice - signalReference) * (record.Side == Side.Buy ? 1.0 : -1.0) / _tickSize
+                : double.NaN;
+
             string row = string.Join(",",
-                record.OpenTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                record.CloseTime.ToString("yyyy-MM-dd HH:mm:ss.fff"),
-                record.Side,
-                entryPrice.ToString("F5"),
-                string.IsNullOrEmpty(exitReason) ? "unknown" : exitReason,
-                record.Mfe.ToString("F1"),
-                record.Mae.ToString("F1"),
-                (double.IsNaN(grossPnL) ? "" : grossPnL.ToString("F2")),
-                (record.FillLatencySec * 1000).ToString("F0"),
-                (double.IsNaN(record.EntryBid) ? "" : record.EntryBid.ToString("F5")),
-                (double.IsNaN(record.EntryAsk) ? "" : record.EntryAsk.ToString("F5")),
-                (double.IsNaN(record.EntryBid) || _tickSize <= 0
-                    ? "" : ((record.EntryAsk - record.EntryBid) / _tickSize).ToString("F2")),
-                (double.IsNaN(record.ExitBid) ? "" : record.ExitBid.ToString("F5")),
-                (double.IsNaN(record.ExitAsk) ? "" : record.ExitAsk.ToString("F5")));
+                record.StrategyRunId, CsvTime(record.StrategyStartTime), record.CrossoverId, CsvTime(record.SignalTime),
+                CsvTime(record.SubmitTime), CsvTime(record.OpenTime), CsvTime(record.CloseTime),
+                record.PositionId, record.EntryOrderId, record.Side, CsvD(record.Quantity, "F0"),
+                CsvD(record.SignalFast1), CsvD(record.SignalSlow1), CsvD(record.SignalFast2), CsvD(record.SignalSlow2),
+                CsvD(record.FastSlopeTicks, "F2"), CsvD(record.SlowSlopeTicks, "F2"), CsvD(record.EmaSeparationTicks, "F2"),
+                CsvD(record.SignalBarOpen), CsvD(record.SignalBarHigh), CsvD(record.SignalBarLow), CsvD(record.SignalBarClose), CsvD(record.SignalBarRangeTicks, "F2"),
+                CsvD(record.SignalBid), CsvD(record.SignalAsk), CsvD(signalSpread, "F2"), CsvD(record.SignalBidSize, "F0"), CsvD(record.SignalAskSize, "F0"), CsvD(record.SignalDepthImbalance, "F4"),
+                CsvD(record.SubmitPrice), CsvD(record.SubmitBid), CsvD(record.SubmitAsk), CsvD(submitSpread, "F2"), CsvD(record.SubmitBidSize, "F0"), CsvD(record.SubmitAskSize, "F0"), CsvD(record.SubmitDepthImbalance, "F4"),
+                CsvD(entryPrice), CsvD(record.FastEmaAtFill), CsvD(record.SlowEmaAtFill), CsvD(record.EmaSeparationAtFillTicks, "F2"),
+                CsvD(record.FillLatencySec * 1000.0, "F0"), CsvD(signalToFillMs, "F0"), CsvD(priceMoveSignalToFillTicks, "F2"),
+                CsvD(record.EntryBid), CsvD(record.EntryAsk), CsvD(fillSpread, "F2"), CsvD(record.FillBidSize, "F0"), CsvD(record.FillAskSize, "F0"), CsvD(record.FillDepthImbalance, "F4"),
+                CsvD(exitPrice), string.IsNullOrEmpty(exitReason) ? "unknown" : exitReason, CsvD(record.Mfe, "F1"), CsvD(record.Mae, "F1"),
+                CsvD(grossPnL, "F2"), CsvD(record.ExitBid), CsvD(record.ExitAsk));
 
             lock (_csvLock) { _tradeBuf.Add(row); }
-
-            // Write through now rather than waiting up to 5s for the timer -- a
-            // closed trade should be on disk before the next one opens.
             Flush();
         }
 
@@ -1544,7 +1747,7 @@ namespace algoTrading
             // NY open/close bursts where spreads/fills are most active.
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 18, 00, 8, 30),  
+                ( 18, 00, 8, 30),
                 (8, 30, 16,  0),   // 3:30–4:00 ET (optional second window)
             };
             foreach (var (sh, sm, eh, em) in windows)
