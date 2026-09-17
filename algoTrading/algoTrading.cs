@@ -659,9 +659,12 @@ namespace algoTrading
         // fast crosses below slow -> sell (go with the down-trend)
         //
         // An opposite crossover overwrites a still-pending, unfilled signal
-        // outright rather than requiring it to be cancelled first. The signal
-        // survives timed-out entry retries (same trend, keep trying) until it
-        // fills, is reversed, or expires via EmaSignalExpirySeconds.
+        // outright rather than requiring it to be cancelled first, and also
+        // cancels a working-but-unfilled entry order from the previous crossover
+        // (see CancelWorkingEntryOnReversal) -- the trend that justified that
+        // order no longer exists, so resting on it is a bet against the signal.
+        // The signal survives timed-out entry retries (same trend, keep trying)
+        // until it fills, is reversed, or expires via EmaSignalExpirySeconds.
         protected void UpdateEntrySignal()
         {
             if (_ema == null || _hdmEma == null || _hdmEma.Count < EmaSlowPeriod + 3) return;
@@ -700,6 +703,7 @@ namespace algoTrading
             // opposite crossover flips it.
             if (crossedUp && _lastCrossoverSide != Side.Buy)
             {
+                CancelWorkingEntryOnReversal(Side.Buy);
                 _lastCrossoverSide = Side.Buy;
                 _pendingSignalSide = Side.Buy;
                 _pendingSignalTime = DateTime.Now;
@@ -708,11 +712,77 @@ namespace algoTrading
             }
             else if (crossedDown && _lastCrossoverSide != Side.Sell)
             {
+                CancelWorkingEntryOnReversal(Side.Sell);
                 _lastCrossoverSide = Side.Sell;
                 _pendingSignalSide = Side.Sell;
                 _pendingSignalTime = DateTime.Now;
                 _activeSignal = CaptureSignalSnapshot(Side.Sell, fast1, slow1, fast2, slow2);
                 Log($"📉 EMA crossover DOWN  fast={fast1:F5} slow={slow1:F5} — going short with the trend", StrategyLoggingLevel.Info);
+            }
+        }
+
+        // ======================================================
+        // REVERSAL CANCEL — kill a resting entry when the trend flips
+        // ======================================================
+        // Called from UpdateEntrySignal the moment a crossover fires in the
+        // OPPOSITE direction to an entry order that is still working unfilled.
+        // Without this, the order sits on the book until EntryTimeoutSeconds
+        // elapses and can fill into a trend that has already turned against it.
+        //
+        // Only the unfilled entry limit is ever cancelled here. A filled position's
+        // take-profit/stop-loss legs are the broker's and are never touched -- the
+        // _hasOpenPosition / partial-fill guards below exist for exactly that.
+        //
+        // Takes _positionLock because it writes _entrySent and _entryLimitOrderId,
+        // which OnEntryTimeout and OnPositionAdded also own. UpdateEntrySignal is
+        // called from OnNewQuote BEFORE that method takes the lock, so this cannot
+        // re-enter it.
+        private void CancelWorkingEntryOnReversal(Side newSide)
+        {
+            lock (_positionLock)
+            {
+                if (_hasOpenPosition) return;
+                if (string.IsNullOrEmpty(_entryLimitOrderId)) return;
+
+                var order = Core.Instance.Orders.FirstOrDefault(o => o.Id == _entryLimitOrderId);
+
+                // Gone from Core's collection: it either just filled (OnPositionAdded
+                // is in flight) or was already cancelled. Either way there is nothing
+                // to cancel, and releasing the entry gate here would race the fill --
+                // OnEntryTimeout owns that resolution.
+                if (order == null)
+                {
+                    Log($"🔄 Opposite crossover ({newSide}) — entry order {_entryLimitOrderId} no longer in Core " +
+                        "(just filled, or already cancelled); leaving it to the entry timeout", StrategyLoggingLevel.Info);
+                    return;
+                }
+
+                // Already the direction of the new crossover — nothing to reverse.
+                if (order.Side == newSide) return;
+
+                if (order.Status == OrderStatus.PartiallyFilled || order.FilledQuantity > 0)
+                {
+                    Log($"⚠️ Reversal to {newSide} but entry {order.Id} ({order.Side}) is partially filled " +
+                        "— leaving it; the position and its bracket take over", StrategyLoggingLevel.Info);
+                    return;
+                }
+
+                if (order.Status != OrderStatus.Opened) return;
+
+                var cancelResult = order.Cancel();
+                if (cancelResult.Status != TradingOperationResultStatus.Success)
+                {
+                    Log($"⚠️ Reversal to {newSide} — cancel of entry {order.Id} failed ({cancelResult.Message}), " +
+                        "likely just filled; leaving it to the entry timeout", StrategyLoggingLevel.Info);
+                    return;
+                }
+
+                _entryLimitTimer?.Stop(); _entryLimitTimer?.Dispose(); _entryLimitTimer = null;
+                _entryLimitOrderId = null;
+                _entrySent = false;
+
+                Log($"🔄 Opposite crossover ({newSide}) — cancelled working {order.Side} entry {order.Id} " +
+                    "before it could fill into the old trend", StrategyLoggingLevel.Trading);
             }
         }
 
