@@ -6,17 +6,17 @@
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <Platforms>AnyCPU</Platforms>
     <AlgoType>Strategy</AlgoType>
-    <AssemblyName>algoTrading</AssemblyName>
-    <RootNamespace>algoTrading</RootNamespace>
+    <AssemblyName>strategyTesting</AssemblyName>
+    <RootNamespace>strategyTesting</RootNamespace>
     <StartAction>Program</StartAction>
     <StartProgram>C:\Quantower\TradingPlatform\v1.145.16\Console.StarterNew.exe</StartProgram>
-    <StartArguments>--address 127.0.0.1 --port 51976</StartArguments>
+    <StartArguments>--address 127.0.0.1 --port 58843</StartArguments>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|AnyCPU'">
-    <OutputPath>C:\Quantower\TradingPlatform\v1.145.16\..\..\Settings\Scripts\Strategies\algoTrading</OutputPath>
+    <OutputPath>C:\Quantower\TradingPlatform\v1.145.16\..\..\Settings\Scripts\Strategies\strategyTesting</OutputPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
-    <OutputPath>C:\Quantower\TradingPlatform\v1.145.16\..\..\Settings\Scripts\Strategies\algoTrading</OutputPath>
+    <OutputPath>C:\Quantower\TradingPlatform\v1.145.16\..\..\Settings\Scripts\Strategies\strategyTesting</OutputPath>
   </PropertyGroup>
   <ItemGroup>
     <Reference Include="TradingPlatform.BusinessLayer">
