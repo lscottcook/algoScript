@@ -1160,7 +1160,7 @@ namespace strategyTesting
                 string reason = _paperEntryPending
                     ? $"a pending {_paperPendingSide} entry did not match the arriving {position.Side} position"
                     : "no entry was pending when this position appeared";
-                AdoptUnexpectedPosition(position, reason);
+                CloseUnexpectedPosition(position, reason);
             }
         }
 
@@ -1176,32 +1176,36 @@ namespace strategyTesting
             }
         }
 
-        // Claims a position the strategy did not just place itself so it stays
-        // under the strategy's own exit management (time exit, session close)
-        // instead of silently going untracked. Never overwrites an already
-        // tracked position, since IsOurSymbol matches by root and could
-        // otherwise misidentify an unrelated position in a different contract
-        // month as ours.
-        private void AdoptUnexpectedPosition(Position position, string reason)
+        // A position that reaches this path did not come from the strategy's
+        // own tracked entry flow, so it carries no verified broker-side SL/TP
+        // (the bracket is only known to exist on the fill the strategy itself
+        // claimed). Rather than adopt it into timed management and let it ride
+        // unprotected for up to EvaluationSeconds, close it immediately. Never
+        // touches an already-tracked position, since IsOurSymbol matches by
+        // root and could otherwise misidentify an unrelated position in a
+        // different contract month as ours.
+        private void CloseUnexpectedPosition(Position position, string reason)
         {
             if (_paperPosition != null)
             {
                 if (_paperPosition.Id == position.Id) return;
                 Log($"PAPER position anomaly: already tracking id={_paperPosition.Id} but an unrelated " +
                     $"position id={position.Id}, side={position.Side}, qty={position.Quantity} appeared for " +
-                    $"our account/symbol ({reason}). Not overwriting the tracked position; check the platform " +
-                    "for a duplicate or unexpected position.", StrategyLoggingLevel.Error);
+                    $"our account/symbol ({reason}). Not touching it; check the platform for a duplicate or " +
+                    "unexpected position.", StrategyLoggingLevel.Error);
                 return;
             }
-            Log($"PAPER position adopted outside the normal entry flow: id={position.Id}, side={position.Side}, " +
+            Log($"PAPER position found outside the normal entry flow: id={position.Id}, side={position.Side}, " +
                 $"qty={position.Quantity} @ {position.OpenPrice:F5} ({reason}). This usually means the platform " +
                 "reissued the position object (partial-fill merge, reconnect reconciliation) or a position was " +
-                "left open from a prior run. It will now be managed by the time-exit and session-close logic.",
-                StrategyLoggingLevel.Error);
-            _paperPosition = position;
-            _paperPositionOpenedUtc = DateTime.UtcNow;
-            _paperEntryPending = false;
-            if (string.IsNullOrEmpty(_paperSignalId)) _paperSignalId = "ADOPTED_" + position.Id;
+                "left open from a prior run. It has no verified stop-loss, so it is being closed immediately " +
+                "rather than adopted.", StrategyLoggingLevel.Error);
+            TradingOperationResult result = Core.Instance.ClosePosition(position);
+            if (result.Status == TradingOperationResultStatus.Success)
+                Log($"Unexpected PAPER position close requested: id={position.Id}.", StrategyLoggingLevel.Trading);
+            else
+                Log($"Unexpected PAPER position close FAILED: id={position.Id}: {result.Message}. " +
+                    "Manual intervention required.", StrategyLoggingLevel.Error);
         }
 
         // Periodic safety net: catches a position that exists on the platform
@@ -1217,7 +1221,7 @@ namespace strategyTesting
             Position orphan = Core.Instance.Positions.FirstOrDefault(
                 p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol));
             if (orphan == null) return;
-            AdoptUnexpectedPosition(orphan, "found during periodic reconciliation with no local tracking");
+            CloseUnexpectedPosition(orphan, "found during periodic reconciliation with no local tracking");
         }
 
         private void HandlePaperTimeExit(DateTime nowUtc)
