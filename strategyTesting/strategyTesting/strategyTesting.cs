@@ -126,6 +126,7 @@ namespace strategyTesting
         private bool _paperTradingBlockedAfterReconnect;
         private Side _paperPendingSide;
         private string _paperSignalId = "";
+        private DateTime _nextReconcileUtc = DateTime.MinValue;
 
         private sealed class TimedTrade
         {
@@ -626,6 +627,7 @@ namespace strategyTesting
                 ActivateDueCheckpoints(nowUtc);
                 FinalizeExpiredEpisodes(nowUtc);
                 HandlePaperTimeExit(nowUtc);
+                ReconcileOrphanedPositions(nowUtc);
             }
         }
 
@@ -1143,13 +1145,22 @@ namespace strategyTesting
         {
             lock (_sync)
             {
-                if (!_paperEntryPending || !IsOurAccount(position.Account) || !IsOurSymbol(position.Symbol)) return;
-                if (position.Side != _paperPendingSide) return;
-                _paperPosition = position;
-                _paperPositionOpenedUtc = DateTime.UtcNow;
-                _paperEntryPending = false;
-                Log($"PAPER position filled: {position.Side} {position.Quantity} @ {position.OpenPrice:F5}; signal={_paperSignalId}",
-                    StrategyLoggingLevel.Trading);
+                if (!IsOurAccount(position.Account) || !IsOurSymbol(position.Symbol)) return;
+
+                if (_paperEntryPending && position.Side == _paperPendingSide)
+                {
+                    _paperPosition = position;
+                    _paperPositionOpenedUtc = DateTime.UtcNow;
+                    _paperEntryPending = false;
+                    Log($"PAPER position filled: {position.Side} {position.Quantity} @ {position.OpenPrice:F5}; signal={_paperSignalId}",
+                        StrategyLoggingLevel.Trading);
+                    return;
+                }
+
+                string reason = _paperEntryPending
+                    ? $"a pending {_paperPendingSide} entry did not match the arriving {position.Side} position"
+                    : "no entry was pending when this position appeared";
+                AdoptUnexpectedPosition(position, reason);
             }
         }
 
@@ -1163,6 +1174,50 @@ namespace strategyTesting
                 _paperPositionOpenedUtc = DateTime.MinValue;
                 _paperSignalId = "";
             }
+        }
+
+        // Claims a position the strategy did not just place itself so it stays
+        // under the strategy's own exit management (time exit, session close)
+        // instead of silently going untracked. Never overwrites an already
+        // tracked position, since IsOurSymbol matches by root and could
+        // otherwise misidentify an unrelated position in a different contract
+        // month as ours.
+        private void AdoptUnexpectedPosition(Position position, string reason)
+        {
+            if (_paperPosition != null)
+            {
+                if (_paperPosition.Id == position.Id) return;
+                Log($"PAPER position anomaly: already tracking id={_paperPosition.Id} but an unrelated " +
+                    $"position id={position.Id}, side={position.Side}, qty={position.Quantity} appeared for " +
+                    $"our account/symbol ({reason}). Not overwriting the tracked position; check the platform " +
+                    "for a duplicate or unexpected position.", StrategyLoggingLevel.Error);
+                return;
+            }
+            Log($"PAPER position adopted outside the normal entry flow: id={position.Id}, side={position.Side}, " +
+                $"qty={position.Quantity} @ {position.OpenPrice:F5} ({reason}). This usually means the platform " +
+                "reissued the position object (partial-fill merge, reconnect reconciliation) or a position was " +
+                "left open from a prior run. It will now be managed by the time-exit and session-close logic.",
+                StrategyLoggingLevel.Error);
+            _paperPosition = position;
+            _paperPositionOpenedUtc = DateTime.UtcNow;
+            _paperEntryPending = false;
+            if (string.IsNullOrEmpty(_paperSignalId)) _paperSignalId = "ADOPTED_" + position.Id;
+        }
+
+        // Periodic safety net: catches a position that exists on the platform
+        // for our account/symbol but that the strategy lost track of (or never
+        // saw a PositionAdded for, e.g. one left open from a prior run started
+        // before this instance subscribed to position events).
+        private void ReconcileOrphanedPositions(DateTime nowUtc)
+        {
+            if (nowUtc < _nextReconcileUtc) return;
+            _nextReconcileUtc = nowUtc.AddSeconds(2);
+            if (_paperPosition != null || _paperEntryPending || CurrentAccount == null || CurrentSymbol == null) return;
+
+            Position orphan = Core.Instance.Positions.FirstOrDefault(
+                p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol));
+            if (orphan == null) return;
+            AdoptUnexpectedPosition(orphan, "found during periodic reconciliation with no local tracking");
         }
 
         private void HandlePaperTimeExit(DateTime nowUtc)
