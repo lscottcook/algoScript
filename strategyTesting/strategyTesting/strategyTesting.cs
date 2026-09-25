@@ -940,8 +940,11 @@ namespace strategyTesting
                 {
                     TradingOperationResult closeResult = Core.Instance.ClosePosition(_paperPosition);
                     if (closeResult.Status == TradingOperationResultStatus.Success)
+                    {
                         Log("PAPER session-close exit requested for signal " + _paperSignalId,
                             StrategyLoggingLevel.Trading);
+                        CancelWorkingOrders("session close");
+                    }
                     else
                         Log("PAPER session-close exit failed: " + closeResult.Message,
                             StrategyLoggingLevel.Error);
@@ -1202,10 +1205,36 @@ namespace strategyTesting
                 "rather than adopted.", StrategyLoggingLevel.Error);
             TradingOperationResult result = Core.Instance.ClosePosition(position);
             if (result.Status == TradingOperationResultStatus.Success)
+            {
                 Log($"Unexpected PAPER position close requested: id={position.Id}.", StrategyLoggingLevel.Trading);
+                // Only sweep stray orders when there is no real entry still in
+                // flight (a side-mismatch call can reach here while _paperEntryPending
+                // is still true and its order may still be working).
+                if (!_paperEntryPending) CancelWorkingOrders("unexpected position closed");
+            }
             else
                 Log($"Unexpected PAPER position close FAILED: id={position.Id}: {result.Message}. " +
                     "Manual intervention required.", StrategyLoggingLevel.Error);
+        }
+
+        // Any SL/TP or other working order left for our account/symbol after a
+        // position close is either stale (its position is gone) or, at minimum,
+        // no longer wanted once we've deliberately exited. Left alone it would
+        // silently block TryPlacePaperOrder's new-entry guard from ever firing
+        // again until someone notices and cancels it by hand.
+        private void CancelWorkingOrders(string reason)
+        {
+            List<Order> working = Core.Instance.Orders.Where(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
+                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled)).ToList();
+            foreach (Order order in working)
+            {
+                TradingOperationResult result = Core.Instance.CancelOrder((IOrder)order);
+                if (result.Status == TradingOperationResultStatus.Success)
+                    Log($"Working order cancelled after close ({reason}): id={order.Id}.", StrategyLoggingLevel.Trading);
+                else
+                    Log($"Failed to cancel working order after close ({reason}): id={order.Id}: {result.Message}.",
+                        StrategyLoggingLevel.Error);
+            }
         }
 
         // Periodic safety net: catches a position that exists on the platform
@@ -1230,8 +1259,11 @@ namespace strategyTesting
             if ((nowUtc - _paperPositionOpenedUtc).TotalSeconds < EvaluationSeconds) return;
             TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
             if (result.Status == TradingOperationResultStatus.Success)
+            {
                 Log("PAPER 600-second time exit requested for signal " + _paperSignalId,
                     StrategyLoggingLevel.Trading);
+                CancelWorkingOrders("600-second time exit");
+            }
             else
                 Log("PAPER time exit failed: " + result.Message, StrategyLoggingLevel.Error);
         }
