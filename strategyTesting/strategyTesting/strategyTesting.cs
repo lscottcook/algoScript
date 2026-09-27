@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Diagnostics.Metrics;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -72,6 +73,11 @@ namespace strategyTesting
 
         [InputParameter("Paper quantity", 14, 1, 10, 1, 0)]
         public int PaperQuantity = 1;
+
+        [InputParameter("Starting Balance", 14)] 
+        public double StartingBalance { get; set; }
+
+
 
         private readonly int[] _featureWindows = { 5, 10, 30, 60 };
         private readonly object _sync = new object();
@@ -356,6 +362,15 @@ namespace strategyTesting
         {
             CurrentSymbol = null;
             CurrentAccount = null;
+        }
+
+
+        protected override void OnInitializeMetrics(Meter meter)
+        {
+            base.OnInitializeMetrics(meter);
+            meter.CreateObservableCounter("balance",
+                () => CurrentAccount.Balance - StartingBalance,
+                description: "Balance");
         }
 
         private void SubscribeMarketData()
