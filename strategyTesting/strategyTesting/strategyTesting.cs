@@ -24,7 +24,8 @@ namespace strategyTesting
     /// The target is the middle band of the signal bar, frozen at signal time.
     ///
     /// No stop loss or take-profit order is attached (by request). Positions are still
-    /// closed at the 4:00 PM ET session-close exit when ExcludeClosedPeriod is on.
+    /// closed at 4:00 PM ET when "Close all positions at 4:00 PM ET" is on.
+    /// New entries are allowed only 18:00 -> 15:30 ET (IsTradingTimeValid); exits are never time-gated.
     ///
     /// Shadow logging is the default. Paper orders require two explicit inputs:
     /// EnablePaperOrders=true and PaperConfirmation="PAPER ONLY".
@@ -48,8 +49,8 @@ namespace strategyTesting
         [InputParameter("Enable shorts", 6)]
         public bool EnableShorts = true;
 
-        [InputParameter("Exclude 4:00-6:00 PM ET", 10)]
-        public bool ExcludeClosedPeriod = true;
+        [InputParameter("Close all positions at 4:00 PM ET", 11)]
+        public bool FlattenAtClose = true;
 
         [InputParameter("Enable PAPER orders", 12)]
         public bool EnablePaperOrders = true;
@@ -113,6 +114,8 @@ namespace strategyTesting
         private int stopLoss; // stop distance in ticks = inputedStopLoss * PaperQuantity, set in OnRun
         private double accountTakeProfit;
         private double accountStopLoss;
+        private DateTime _nextFlattenUtc = DateTime.MinValue;
+        private DateTime _exitRequestedUtc = DateTime.MinValue;
         private double _baselineBalance;
         private bool _accountLimitLogged;
         private DateTime _lastQuoteUtc = DateTime.MinValue;
@@ -392,9 +395,9 @@ namespace strategyTesting
             string reject = "";
             DateTime decisionUtc = DateTime.MinValue;
 
-            if (IsClosedEt(callbackUtc))
+            if (!IsTradingTimeValid(ToEastern(callbackUtc).TimeOfDay))
             {
-                result = "SKIP"; reject = "closed_period";
+                result = "SKIP"; reject = "outside_trading_hours";
                 _longArmed = _shortArmed = false;
             }
             else if (_barsSeen < KeltnerPeriod + 2)
@@ -601,6 +604,7 @@ namespace strategyTesting
             string reason = (stopHit ? "STOP_LOSS_" : "FROZEN_TARGET_") + basis;
 
             _exitRequested = true;
+            _exitRequestedUtc = DateTime.UtcNow;
             TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
             if (result.Status == TradingOperationResultStatus.Success)
             {
@@ -808,41 +812,83 @@ namespace strategyTesting
 
         private void HandleClosedPeriod(DateTime nowUtc)
         {
-            bool closed = IsClosedEt(nowUtc);
-            if (closed && !_closedState)
+            bool flatten = FlattenAtClose && IsFlattenTimeEt(nowUtc);
+            if (flatten && !_closedState)
             {
                 _longArmed = _shortArmed = false;
                 _closedState = true;
-                if (_paperPosition != null && !_exitRequested)
-                {
-                    _exitRequested = true;
-                    TradingOperationResult closeResult = Core.Instance.ClosePosition(_paperPosition);
-                    if (closeResult.Status == TradingOperationResultStatus.Success)
-                    {
-                        Log("PAPER session-close exit requested for signal " + _paperSignalId,
-                            StrategyLoggingLevel.Trading);
-                        if (_openRecord != null)
-                            WriteTradeRow(_openRecord, nowUtc, "SESSION_CLOSE", double.NaN, _openRecord.Middle);
-                        CancelWorkingOrders("session close");
-                    }
-                    else
-                    {
-                        _exitRequested = false;
-                        Log("PAPER session-close exit failed: " + closeResult.Message, StrategyLoggingLevel.Error);
-                    }
-                }
+                _nextFlattenUtc = DateTime.MinValue;
             }
-            else if (!closed && _closedState)
+            else if (!flatten && _closedState)
             {
                 _closedState = false;
             }
+            if (flatten) FlattenAll(nowUtc);
         }
 
-        private bool IsClosedEt(DateTime utc)
+        // From 4:00 PM ET, close every position (and cancel working orders) on our account/symbol.
+        // Keeps checking while the window is open, so a failed close or a late fill is retried.
+        private void FlattenAll(DateTime nowUtc)
         {
-            if (!ExcludeClosedPeriod) return false;
+            if (nowUtc < _nextFlattenUtc || CurrentAccount == null || CurrentSymbol == null) return;
+            List<Position> positions = Core.Instance.Positions
+                .Where(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol)).ToList();
+            bool working = Core.Instance.Orders.Any(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
+                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled));
+            if (positions.Count == 0 && !working) return;
+
+            _nextFlattenUtc = nowUtc.AddSeconds(5); // do not stack close orders while one is in flight
+            if (working) CancelWorkingOrders("4:00 PM ET close");
+
+            foreach (Position p in positions)
+            {
+                bool tracked = _paperPosition != null && p.Id == _paperPosition.Id;
+                // A close already requested in the last 5 seconds (e.g. target/stop) is still in flight.
+                if (tracked && _exitRequested && (nowUtc - _exitRequestedUtc).TotalSeconds < 5) continue;
+
+                TradingOperationResult result = Core.Instance.ClosePosition(p);
+                if (result.Status == TradingOperationResultStatus.Success)
+                {
+                    Log($"4:00 PM ET close requested: position {p.Id} {p.Side} {p.Quantity}.", StrategyLoggingLevel.Trading);
+                    if (tracked)
+                    {
+                        if (!_exitRequested && _openRecord != null)
+                            WriteTradeRow(_openRecord, nowUtc, "SESSION_CLOSE", double.NaN, _openRecord.Middle);
+                        _exitRequested = true;
+                        _exitRequestedUtc = nowUtc;
+                    }
+                }
+                else
+                    Log($"4:00 PM ET close FAILED for position {p.Id}: {result.Message}. Retrying in 5s.",
+                        StrategyLoggingLevel.Error);
+            }
+        }
+
+        // Positions are flattened from 4:00 PM ET until the 6:00 PM ET reopen.
+        private bool IsFlattenTimeEt(DateTime utc)
+        {
             DateTime et = ToEastern(utc);
             return et.Hour >= 16 && et.Hour < 18;
+        }
+
+        // Entry window only (Eastern time of day). Exits, stops and the 4 PM close are never gated by this.
+        private bool IsTradingTimeValid(TimeSpan t)
+        {
+            var windows = new (int sh, int sm, int eh, int em)[]
+            {
+                ( 18,  0, 15,  30),
+            };
+
+            foreach (var (sh, sm, eh, em) in windows)
+            {
+                var start = TimeSpan.FromMinutes(sh * 60 + sm);
+                var end = TimeSpan.FromMinutes(eh * 60 + em);
+                bool inWindow = end == TimeSpan.Zero ? t >= start
+                              : start < end ? t >= start && t < end
+                                            : t >= start || t < end;
+                if (inWindow) return true;
+            }
+            return false;
         }
 
         // ------------------------------------------------------------------
