@@ -10,13 +10,18 @@ using TradingPlatform.BusinessLayer;
 namespace strategyTesting
 {
     /// <summary>
-    /// Keltner re-entry strategy (3-minute bars).
+    /// Keltner re-entry strategy (30-second bars).
     ///
-    /// LONG:  a 3-minute bar CLOSES below the lower band (setup armed), then a later
-    ///        3-minute bar CLOSES back above the lower band -> buy at market.
-    ///        Exit when any trade prints at or above the middle band.
-    /// SHORT: mirror image — close above the upper band arms; a later close back
-    ///        below the upper band sells; exit when a trade prints at or below the middle band.
+    /// Bands: middle = EMA(close, KeltnerPeriod); width = EMA(true range, AtrPeriod);
+    /// upper/lower = middle +/- multiplier * width. Computed in code from closed bars.
+    ///
+    /// LONG:  a bar CLOSES below the lower band (setup armed), then a later bar CLOSES
+    ///        strictly above the lower band -> buy at market, only if ask &lt; frozen target.
+    ///        Exit when the bid reaches the frozen target (last trade if no bid/ask).
+    /// SHORT: mirror image — close above the upper band arms; a later close strictly
+    ///        below the upper band sells, only if bid &gt; frozen target; exit when the ask
+    ///        reaches the frozen target (last trade if no bid/ask).
+    /// The target is the middle band of the signal bar, frozen at signal time.
     ///
     /// No stop loss or take-profit order is attached (by request). Positions are still
     /// closed at the 4:00 PM ET session-close exit when ExcludeClosedPeriod is on.
@@ -32,17 +37,17 @@ namespace strategyTesting
         [InputParameter("Account", 1)]
         public Account CurrentAccount { get; set; }
 
-        [InputParameter("Bar period (minutes)", 2, 1, 60, 1, 0)]
-        public int BarMinutes = 3;
+        [InputParameter("Bar period (seconds)", 2, 5, 600, 1, 0)]
+        public int BarSeconds = 30;
 
         [InputParameter("Keltner EMA period (middle band)", 3, 2, 200, 1, 0)]
         public int KeltnerPeriod = 20;
 
-        [InputParameter("Keltner ATR multiplier", 4, 0.1, 10, 0.1, 1)]
+        [InputParameter("Keltner width multiplier", 4, 0.1, 10, 0.1, 1)]
         public double KeltnerOffset = 1.0;
 
-        [InputParameter("Keltner ATR period", 7, 1, 200, 1, 0)]
-        public int AtrPeriod = 10;
+        [InputParameter("True-range EMA period (width)", 7, 1, 200, 1, 0)]
+        public int AtrPeriod = 20;
 
         [InputParameter("Enable longs", 5)]
         public bool EnableLongs = true;
@@ -62,7 +67,7 @@ namespace strategyTesting
         [InputParameter("Paper quantity", 14, 1, 10, 1, 0)]
         public int PaperQuantity = 1;
 
-        [InputParameter("Starting Balance", 14)]
+        [InputParameter("Starting Balance", 15)]
         public double StartingBalance { get; set; }
 
         private readonly object _sync = new object();
@@ -83,12 +88,19 @@ namespace strategyTesting
         private System.Timers.Timer _housekeepingTimer;
         private System.Timers.Timer _flushTimer;
 
-        // 3-minute bars + Keltner built from EMA (middle) and ATR (width):
-        // upper = EMA + mult*ATR, lower = EMA - mult*ATR.
+        // 30-second bars + Keltner computed incrementally from closed bars:
+        // middle = EMA(close), width = EMA(true range); upper/lower = middle +/- mult*width.
         private HistoricalData _history;
-        private Indicator _ema;
-        private Indicator _atr;
-        private const int _upperLine = 0, _middleLine = 1, _lowerLine = 2;
+        private double _midEma, _widthEma, _prevClose;
+        private int _barsSeen;
+        private DateTime _lastBarUtc = DateTime.MinValue;
+
+        // Latest quote seen (receive time is local; the feed gives no quote timestamp we rely on).
+        private double _lastBid = double.NaN, _lastAsk = double.NaN, _lastTradePrice;
+        private DateTime _lastQuoteUtc = DateTime.MinValue;
+
+        private string _barCsv;
+        private readonly List<string> _barBuffer = new List<string>();
 
         // Setup state
         private bool _longArmed;
@@ -117,6 +129,9 @@ namespace strategyTesting
             public DateTime SubmitUtc;
             public DateTime FillUtc;
             public double FillPrice = double.NaN;
+            // Timings (UTC): bar callback received, calculation done, order acknowledged.
+            public DateTime CallbackUtc, CalcDoneUtc, AckUtc;
+            public string RejectReason = "";
         }
 
         public strategyTesting()
@@ -143,8 +158,9 @@ namespace strategyTesting
                 return;
             }
 
-            BarMinutes = Math.Max(1, BarMinutes);
+            BarSeconds = Math.Max(5, BarSeconds);
             KeltnerPeriod = Math.Max(2, KeltnerPeriod);
+            AtrPeriod = Math.Max(1, AtrPeriod);
             PaperQuantity = Math.Max(1, PaperQuantity);
 
             _runId = Guid.NewGuid().ToString("N");
@@ -152,13 +168,24 @@ namespace strategyTesting
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
             _tradeCsv = Path.Combine(downloads, "strategyTesting_keltner_trades.csv");
             EnsureHeader(_tradeCsv,
-                "runId,signalId,side,setupBarUtc,signalBarUtc,signalClose,upper,middle,lower," +
-                "submitUtc,fillUtc,fillPrice,exitUtc,exitReason,exitTriggerPrice,middleAtExit,signedPoints");
+                "runId,signalId,side,setupBarUtc,signalBarUtc,signalClose,upper,frozenTarget,lower," +
+                "submitUtc,fillUtc,fillPrice,exitUtc,exitReason,exitTriggerPrice,targetAtExit,signedPoints," +
+                "barCallbackUtc,calcDoneUtc,ackUtc,calcMs,submitLagMs,ackMs,fillMs,rejectReason");
+            _barCsv = Path.Combine(downloads, "strategyTesting_keltner_bars.csv");
+            EnsureHeader(_barCsv,
+                "runId,barUtc,open,high,low,close,upper,middle,lower,trueRange,widthEma,barsSeen," +
+                "setupState,result,rejectReason,heightTicks,bodyTicks,closeUpperTicks,closeLowerTicks," +
+                "bid,ask,spreadTicks,quoteAgeMs,callbackUtc,calcDoneUtc,decisionUtc,calcMs,callbackLagMs");
 
+            _lastBid = _lastAsk = double.NaN;
+            _lastQuoteUtc = DateTime.MinValue;
+            _longArmed = _shortArmed = false;
             if (!LoadHistory()) return;
 
             CurrentSymbol.NewLast -= OnNewLast;
             CurrentSymbol.NewLast += OnNewLast;
+            CurrentSymbol.NewQuote -= OnNewQuote;
+            CurrentSymbol.NewQuote += OnNewQuote;
             Core.Instance.PositionAdded += OnPositionAdded;
             Core.Instance.PositionRemoved += OnPositionRemoved;
 
@@ -180,7 +207,7 @@ namespace strategyTesting
             _flushTimer.Elapsed += (s, e) => Flush();
             _flushTimer.Start();
 
-            Log($"Keltner re-entry started for {CurrentSymbol.Name}: {BarMinutes}-min bars, KC(EMA {KeltnerPeriod}, ATR {AtrPeriod} x {KeltnerOffset}). " +
+            Log($"Keltner re-entry started for {CurrentSymbol.Name}: {BarSeconds}-sec bars, KC(EMA {KeltnerPeriod}, TR-EMA {AtrPeriod} x {KeltnerOffset}). " +
                 $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. No stop loss.",
                 StrategyLoggingLevel.Info);
             Log($"Trades: {_tradeCsv}", StrategyLoggingLevel.Info);
@@ -189,7 +216,11 @@ namespace strategyTesting
         protected override void OnStop()
         {
             _stopping = true;
-            if (CurrentSymbol != null) CurrentSymbol.NewLast -= OnNewLast;
+            if (CurrentSymbol != null)
+            {
+                CurrentSymbol.NewLast -= OnNewLast;
+                CurrentSymbol.NewQuote -= OnNewQuote;
+            }
             Core.Instance.PositionAdded -= OnPositionAdded;
             Core.Instance.PositionRemoved -= OnPositionRemoved;
 
@@ -235,29 +266,34 @@ namespace strategyTesting
             try
             {
                 UnloadHistory();
-                // Enough history to warm up the indicator even across a weekend.
-                _history = CurrentSymbol.GetHistory(new Period(BasePeriod.Minute, BarMinutes),
-                    HistoryType.Last, DateTime.UtcNow.AddDays(-4));
-                _ema = Core.Indicators.BuiltIn.EMA(KeltnerPeriod, PriceType.Close);
-                // SMMA = Wilder's smoothing (TradingView's RMA), the standard ATR smoothing.
-                _atr = Core.Indicators.BuiltIn.ATR(AtrPeriod, MaMode.SMMA);
-                _history.AddIndicator(_ema);
-                _history.AddIndicator(_atr);
+                _midEma = _widthEma = _prevClose = 0;
+                _barsSeen = 0;
+                _lastBarUtc = DateTime.MinValue;
+                // Enough history to warm up the EMAs even across a weekend.
+                _history = CurrentSymbol.GetHistory(new Period(BasePeriod.Second, BarSeconds),
+                    HistoryType.Last, DateTime.UtcNow.AddDays(-3));
                 _history.NewHistoryItem += OnNewHistoryItem;
 
-                if (double.IsNaN(Band(1, _middleLine)) || double.IsNaN(Band(1, _upperLine)))
+                // Seed the EMAs oldest -> newest over every closed bar (offset 0 is the forming bar).
+                BarCalc last = null;
+                for (int offset = _history.Count - 1; offset >= 1; offset--)
                 {
-                    Log("EMA/ATR have no value yet on the last closed bar.", StrategyLoggingLevel.Error);
+                    BarCalc b = AdvanceBar(_history[offset, SeekOriginHistory.End]);
+                    if (b != null) last = b;
+                }
+                if (last == null || _barsSeen < KeltnerPeriod + 2)
+                {
+                    Log($"Only {_barsSeen} closed bars available; need at least {KeltnerPeriod + 2}.", StrategyLoggingLevel.Error);
                     return false;
                 }
-                Log($"Loaded {_history.Count} bars. Last closed bar: upper={Band(1, _upperLine):F2}, " +
-                    $"middle={Band(1, _middleLine):F2}, lower={Band(1, _lowerLine):F2}. " +
+                Log($"Loaded {_barsSeen} closed {BarSeconds}s bars. Last closed bar: upper={last.Upper:F2}, " +
+                    $"middle={last.Middle:F2}, lower={last.Lower:F2}. " +
                     "Compare these with the chart before trusting signals.", StrategyLoggingLevel.Info);
                 return true;
             }
             catch (Exception ex)
             {
-                Log("History/indicator load failed: " + ex.Message, StrategyLoggingLevel.Error);
+                Log("History load failed: " + ex.Message, StrategyLoggingLevel.Error);
                 return false;
             }
         }
@@ -266,119 +302,189 @@ namespace strategyTesting
         {
             if (_history == null) return;
             _history.NewHistoryItem -= OnNewHistoryItem;
-            if (_ema != null) _history.RemoveIndicator(_ema);
-            if (_atr != null) _history.RemoveIndicator(_atr);
             _history.Dispose();
             _history = null;
-            _ema = null;
-            _atr = null;
         }
 
-        // offset 0 = forming bar, 1 = last closed bar.
-        private double Band(int offset, int line)
+        private sealed class BarCalc
         {
-            if (_ema == null || _atr == null) return double.NaN;
-            double mid = _ema.GetValue(offset);
-            if (line == _middleLine) return mid;
-            double width = KeltnerOffset * _atr.GetValue(offset);
-            return line == _upperLine ? mid + width : mid - width;
+            public DateTime Utc;
+            public double Open, High, Low, Close, Tr, Upper, Middle, Lower;
+        }
+
+        // Feeds one closed bar into the EMAs. Returns null if the bar is stale or has bad data.
+        // Width is an EMA of true range (first bar: high-low), middle is an EMA of close.
+        private BarCalc AdvanceBar(IHistoryItem bar)
+        {
+            DateTime t = bar.TimeLeft;
+            if (t <= _lastBarUtc) return null;
+            double o = bar[PriceType.Open], h = bar[PriceType.High], l = bar[PriceType.Low], c = bar[PriceType.Close];
+            if (double.IsNaN(o) || double.IsNaN(h) || double.IsNaN(l) || double.IsNaN(c)) return null;
+
+            double tr = _barsSeen == 0
+                ? h - l
+                : Math.Max(h - l, Math.Max(Math.Abs(h - _prevClose), Math.Abs(l - _prevClose)));
+            if (_barsSeen == 0) { _midEma = c; _widthEma = tr; }
+            else
+            {
+                _midEma += 2.0 / (KeltnerPeriod + 1) * (c - _midEma);
+                _widthEma += 2.0 / (AtrPeriod + 1) * (tr - _widthEma);
+            }
+            _barsSeen++;
+            _prevClose = c;
+            _lastBarUtc = t;
+            return new BarCalc
+            {
+                Utc = t, Open = o, High = h, Low = l, Close = c, Tr = tr,
+                Middle = _midEma,
+                Upper = _midEma + KeltnerOffset * _widthEma,
+                Lower = _midEma - KeltnerOffset * _widthEma
+            };
         }
 
         // Fires when a new bar opens, so offset 1 is the bar that just closed.
         private void OnNewHistoryItem(object sender, HistoryEventArgs e)
         {
+            DateTime callbackUtc = DateTime.UtcNow;
             if (_stopping) return;
             lock (_sync)
             {
-                if (_history == null || _history.Count < KeltnerPeriod + 2) return;
-                DateTime nowUtc = DateTime.UtcNow;
-                HandleClosedPeriod(nowUtc);
-                if (IsClosedEt(nowUtc)) return;
-
-                IHistoryItem closedBar = _history[1, SeekOriginHistory.End];
-                double close = closedBar[PriceType.Close];
-                DateTime barUtc = closedBar.TimeLeft;
-                double upper = Band(1, _upperLine);
-                double middle = Band(1, _middleLine);
-                double lower = Band(1, _lowerLine);
-                if (double.IsNaN(close) || double.IsNaN(upper) || double.IsNaN(middle) || double.IsNaN(lower)) return;
-
-                // Only look for setups while flat.
-                if (_paperPosition != null || _paperEntryPending)
+                if (_history == null) return;
+                HandleClosedPeriod(callbackUtc);
+                // Normally exactly one new closed bar; catch up if a callback was missed.
+                for (int offset = Math.Min(_history.Count - 1, 50); offset >= 1; offset--)
                 {
-                    _longArmed = _shortArmed = false;
-                    return;
-                }
-
-                if (close < lower)
-                {
-                    if (EnableLongs && !_longArmed)
-                        Log($"LONG setup armed: bar {barUtc:HH:mm} closed {close:F2} below lower band {lower:F2}.",
-                            StrategyLoggingLevel.Info);
-                    if (EnableLongs && !_longArmed) _armedBarUtc = barUtc;
-                    _longArmed = EnableLongs;
-                    _shortArmed = false;
-                    return;
-                }
-                if (close > upper)
-                {
-                    if (EnableShorts && !_shortArmed)
-                        Log($"SHORT setup armed: bar {barUtc:HH:mm} closed {close:F2} above upper band {upper:F2}.",
-                            StrategyLoggingLevel.Info);
-                    if (EnableShorts && !_shortArmed) _armedBarUtc = barUtc;
-                    _shortArmed = EnableShorts;
-                    _longArmed = false;
-                    return;
-                }
-
-                // Close is back inside the bands.
-                if (_longArmed)
-                {
-                    _longArmed = false;
-                    if (close >= middle)
-                        Log($"LONG skipped: re-entry bar closed {close:F2} at/above middle {middle:F2} (no room to target).",
-                            StrategyLoggingLevel.Info);
-                    else
-                        Signal(Side.Buy, barUtc, close, upper, middle, lower);
-                }
-                else if (_shortArmed)
-                {
-                    _shortArmed = false;
-                    if (close <= middle)
-                        Log($"SHORT skipped: re-entry bar closed {close:F2} at/below middle {middle:F2} (no room to target).",
-                            StrategyLoggingLevel.Info);
-                    else
-                        Signal(Side.Sell, barUtc, close, upper, middle, lower);
+                    BarCalc b = AdvanceBar(_history[offset, SeekOriginHistory.End]);
+                    if (b != null) EvaluateBar(b, callbackUtc, DateTime.UtcNow);
                 }
             }
         }
 
-        private void Signal(Side side, DateTime barUtc, double close, double upper, double middle, double lower)
+        private void EvaluateBar(BarCalc b, DateTime callbackUtc, DateTime calcDoneUtc)
         {
+            string result = "NONE";
+            string reject = "";
+            DateTime decisionUtc = DateTime.MinValue;
+
+            if (IsClosedEt(callbackUtc))
+            {
+                result = "SKIP"; reject = "closed_period";
+                _longArmed = _shortArmed = false;
+            }
+            else if (_barsSeen < KeltnerPeriod + 2)
+            {
+                result = "SKIP"; reject = "warmup";
+            }
+            else if (_paperPosition != null || _paperEntryPending)
+            {
+                // Only look for setups while flat.
+                result = "SKIP"; reject = "position_open";
+                _longArmed = _shortArmed = false;
+            }
+            else if (b.Close < b.Lower)
+            {
+                if (EnableLongs && !_longArmed)
+                {
+                    _armedBarUtc = b.Utc;
+                    Log($"LONG setup armed: bar {b.Utc:HH:mm:ss} closed {b.Close:F2} below lower band {b.Lower:F2}.",
+                        StrategyLoggingLevel.Info);
+                }
+                _longArmed = EnableLongs;
+                _shortArmed = false;
+                result = EnableLongs ? "ARMED_LONG" : "SETUP_IGNORED";
+                if (!EnableLongs) reject = "longs_disabled";
+            }
+            else if (b.Close > b.Upper)
+            {
+                if (EnableShorts && !_shortArmed)
+                {
+                    _armedBarUtc = b.Utc;
+                    Log($"SHORT setup armed: bar {b.Utc:HH:mm:ss} closed {b.Close:F2} above upper band {b.Upper:F2}.",
+                        StrategyLoggingLevel.Info);
+                }
+                _shortArmed = EnableShorts;
+                _longArmed = false;
+                result = EnableShorts ? "ARMED_SHORT" : "SETUP_IGNORED";
+                if (!EnableShorts) reject = "shorts_disabled";
+            }
+            // Re-entry needs a close STRICTLY back across the band; a close exactly on it stays armed.
+            else if (_longArmed && b.Close > b.Lower)
+            {
+                _longArmed = false;
+                reject = Signal(Side.Buy, b, callbackUtc, calcDoneUtc, out decisionUtc);
+                result = reject.Length == 0 ? "ENTRY_SENT" : "ENTRY_REJECTED";
+            }
+            else if (_shortArmed && b.Close < b.Upper)
+            {
+                _shortArmed = false;
+                reject = Signal(Side.Sell, b, callbackUtc, calcDoneUtc, out decisionUtc);
+                result = reject.Length == 0 ? "ENTRY_SENT" : "ENTRY_REJECTED";
+            }
+            else if (_longArmed || _shortArmed)
+            {
+                result = "HOLD_ARMED";
+            }
+
+            WriteBarRow(b, result, reject, callbackUtc, calcDoneUtc, decisionUtc);
+        }
+
+        private bool GetQuote(out double bid, out double ask)
+        {
+            bid = _lastBid;
+            ask = _lastAsk;
+            if (!(bid > 0) || !(ask > 0))
+            {
+                bid = CurrentSymbol != null ? CurrentSymbol.Bid : double.NaN;
+                ask = CurrentSymbol != null ? CurrentSymbol.Ask : double.NaN;
+            }
+            return bid > 0 && ask > 0 && !double.IsNaN(bid) && !double.IsNaN(ask);
+        }
+
+        // Returns "" when an entry order was submitted, otherwise the rejection reason.
+        private string Signal(Side side, BarCalc b, DateTime callbackUtc, DateTime calcDoneUtc, out DateTime decisionUtc)
+        {
+            decisionUtc = DateTime.UtcNow;
             var record = new TradeRecord
             {
                 SignalId = _runId + "-S" + (++_signalSequence).ToString("D6"),
                 Side = side,
                 SetupBarUtc = _armedBarUtc,
-                SignalBarUtc = barUtc,
-                SignalClose = close,
-                Upper = upper,
-                Middle = middle,
-                Lower = lower,
-                SubmitUtc = DateTime.UtcNow
+                SignalBarUtc = b.Utc,
+                SignalClose = b.Close,
+                Upper = b.Upper,
+                Middle = b.Middle, // frozen target for this trade
+                Lower = b.Lower,
+                SubmitUtc = decisionUtc,
+                CallbackUtc = callbackUtc,
+                CalcDoneUtc = calcDoneUtc
             };
-            Log($"{side} signal {record.SignalId}: bar {barUtc:HH:mm} closed {close:F2} back inside " +
-                $"(U {upper:F2} / M {middle:F2} / L {lower:F2}).", StrategyLoggingLevel.Trading);
+            Log($"{side} signal {record.SignalId}: bar {b.Utc:HH:mm:ss} closed {b.Close:F2} back inside " +
+                $"(U {b.Upper:F2} / frozen target M {b.Middle:F2} / L {b.Lower:F2}).", StrategyLoggingLevel.Trading);
 
-            if (!TryPlacePaperOrder(record))
+            // Entry gate: buy only if ask is still below the target; sell only if bid is still above it.
+            double bid, ask;
+            string reject = "";
+            if (!GetQuote(out bid, out ask)) reject = "no_quote";
+            else if (side == Side.Buy && !(ask < b.Middle)) reject = "ask_not_below_target";
+            else if (side == Side.Sell && !(bid > b.Middle)) reject = "bid_not_above_target";
+
+            if (reject.Length == 0 && !TryPlacePaperOrder(record))
+                reject = record.RejectReason.Length > 0 ? record.RejectReason : "entry_refused";
+
+            if (reject.Length > 0)
             {
+                record.RejectReason = reject;
+                Log($"{side} entry rejected ({reject}): bid {bid:F2}, ask {ask:F2}, target {b.Middle:F2}.",
+                    StrategyLoggingLevel.Info);
                 // Shadow mode (or entry refused): log the signal with no fill.
                 WriteTradeRow(record, DateTime.MinValue, "NO_ORDER", double.NaN, double.NaN);
             }
+            return reject;
         }
 
         // ------------------------------------------------------------------
-        // Exit: first trade at/through the middle band of the forming bar
+        // Exit: bid reaches the frozen target (longs) / ask reaches it (shorts);
+        // last trade is used only when no bid/ask is available.
         // ------------------------------------------------------------------
 
         private void OnNewLast(Symbol symbol, Last last)
@@ -386,27 +492,58 @@ namespace strategyTesting
             if (_stopping || last == null || last.Price <= 0) return;
             lock (_sync)
             {
-                if (_paperPosition == null || _exitRequested || _ema == null) return;
-                double middle = Band(0, _middleLine);
-                if (double.IsNaN(middle)) return;
+                _lastTradePrice = last.Price;
+                CheckExit();
+            }
+        }
 
-                bool hit = _paperPosition.Side == Side.Buy ? last.Price >= middle : last.Price <= middle;
-                if (!hit) return;
+        private void OnNewQuote(Symbol symbol, Quote quote)
+        {
+            if (_stopping || quote == null) return;
+            lock (_sync)
+            {
+                if (quote.Bid > 0) _lastBid = quote.Bid;
+                if (quote.Ask > 0) _lastAsk = quote.Ask;
+                _lastQuoteUtc = DateTime.UtcNow;
+                CheckExit();
+            }
+        }
 
-                _exitRequested = true;
-                TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
-                if (result.Status == TradingOperationResultStatus.Success)
-                {
-                    Log($"PAPER exit requested at middle band: trade {last.Price:F2}, middle {middle:F2}; signal={_paperSignalId}",
-                        StrategyLoggingLevel.Trading);
-                    if (_openRecord != null)
-                        WriteTradeRow(_openRecord, DateTime.UtcNow, "MIDDLE_BAND", last.Price, middle);
-                }
-                else
-                {
-                    _exitRequested = false;
-                    Log("PAPER middle-band exit failed: " + result.Message, StrategyLoggingLevel.Error);
-                }
+        private void CheckExit()
+        {
+            if (_paperPosition == null || _exitRequested || _openRecord == null) return;
+            double target = _openRecord.Middle;
+            bool isLong = _paperPosition.Side == Side.Buy;
+
+            double bid, ask, trigger;
+            string basis;
+            if (GetQuote(out bid, out ask))
+            {
+                trigger = isLong ? bid : ask;
+                basis = isLong ? "BID" : "ASK";
+            }
+            else if (_lastTradePrice > 0)
+            {
+                trigger = _lastTradePrice;
+                basis = "LAST";
+            }
+            else return;
+
+            bool hit = isLong ? trigger >= target : trigger <= target;
+            if (!hit) return;
+
+            _exitRequested = true;
+            TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
+            if (result.Status == TradingOperationResultStatus.Success)
+            {
+                Log($"PAPER exit requested at frozen target: {basis} {trigger:F2}, target {target:F2}; signal={_paperSignalId}",
+                    StrategyLoggingLevel.Trading);
+                WriteTradeRow(_openRecord, DateTime.UtcNow, "FROZEN_TARGET_" + basis, trigger, target);
+            }
+            else
+            {
+                _exitRequested = false;
+                Log("PAPER target exit failed: " + result.Message, StrategyLoggingLevel.Error);
             }
         }
 
@@ -428,33 +565,39 @@ namespace strategyTesting
 
         private bool TryPlacePaperOrder(TradeRecord record)
         {
-            if (!EnablePaperOrders) return false;
+            if (!EnablePaperOrders) { record.RejectReason = "shadow_mode"; return false; }
             if (_paperTradingBlockedAfterReconnect)
             {
                 Log("Signal not traded: paper execution is blocked after reconnect until strategy restart.",
                     StrategyLoggingLevel.Error);
+                record.RejectReason = "blocked_after_reconnect";
                 return false;
             }
             if (!string.Equals(PaperConfirmation?.Trim(), "PAPER ONLY", StringComparison.Ordinal))
             {
                 Log("Signal not traded: Paper confirmation must equal PAPER ONLY.", StrategyLoggingLevel.Error);
+                record.RejectReason = "confirmation_text";
                 return false;
             }
             if (CurrentAccount == null)
             {
                 Log("Signal not traded: no account selected.", StrategyLoggingLevel.Error);
+                record.RejectReason = "no_account";
                 return false;
             }
-            if (_paperEntryPending || _paperPosition != null) return false;
-            if (Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol))) return false;
+            if (_paperEntryPending || _paperPosition != null) { record.RejectReason = "position_open"; return false; }
+            if (Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol)))
+            { record.RejectReason = "account_has_position"; return false; }
             if (Core.Instance.Orders.Any(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
-                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))) return false;
+                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled)))
+            { record.RejectReason = "working_order_exists"; return false; }
 
             _paperEntryPending = true;
             _paperPendingSide = record.Side;
             _paperSignalId = record.SignalId;
             _openRecord = record;
 
+            record.SubmitUtc = DateTime.UtcNow;
             var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
             {
                 Symbol = CurrentSymbol,
@@ -465,11 +608,13 @@ namespace strategyTesting
                 TimeInForce = TimeInForce.GTC,
                 Comment = "KC_REENTRY"
             });
+            record.AckUtc = DateTime.UtcNow;
             if (result.Status != TradingOperationResultStatus.Success)
             {
                 _paperEntryPending = false;
                 _paperSignalId = "";
                 _openRecord = null;
+                record.RejectReason = "order_failed";
                 Log("Paper entry failed: " + result.Message, StrategyLoggingLevel.Error);
                 return false;
             }
@@ -514,7 +659,7 @@ namespace strategyTesting
                 Log($"PAPER position closed: {position.Id}; signal={_paperSignalId}", StrategyLoggingLevel.Trading);
                 // Closed by something other than the middle-band exit (manual close, session close, platform).
                 if (!_exitRequested && _openRecord != null)
-                    WriteTradeRow(_openRecord, DateTime.UtcNow, "CLOSED_ELSEWHERE", double.NaN, Band(0, _middleLine));
+                    WriteTradeRow(_openRecord, DateTime.UtcNow, "CLOSED_ELSEWHERE", double.NaN, _openRecord.Middle);
                 _paperPosition = null;
                 _paperSignalId = "";
                 _openRecord = null;
@@ -609,7 +754,7 @@ namespace strategyTesting
                         Log("PAPER session-close exit requested for signal " + _paperSignalId,
                             StrategyLoggingLevel.Trading);
                         if (_openRecord != null)
-                            WriteTradeRow(_openRecord, nowUtc, "SESSION_CLOSE", double.NaN, Band(0, _middleLine));
+                            WriteTradeRow(_openRecord, nowUtc, "SESSION_CLOSE", double.NaN, _openRecord.Middle);
                         CancelWorkingOrders("session close");
                     }
                     else
@@ -710,11 +855,13 @@ namespace strategyTesting
                     string accountId = CurrentAccount?.Id;
                     var symbolInfo = CurrentSymbol.CreateInfo();
                     CurrentSymbol.NewLast -= OnNewLast;
+                    CurrentSymbol.NewQuote -= OnNewQuote;
                     CurrentSymbol = Core.GetSymbol(symbolInfo);
                     if (CurrentSymbol == null)
                         throw new InvalidOperationException("Could not reacquire the selected symbol.");
                     _tickSize = CurrentSymbol.TickSize;
                     CurrentSymbol.NewLast += OnNewLast;
+                    CurrentSymbol.NewQuote += OnNewQuote;
 
                     if (!string.IsNullOrEmpty(accountId))
                     {
@@ -775,9 +922,43 @@ namespace strategyTesting
                 _runId, r.SignalId, r.Side.ToString(), CsvTime(r.SetupBarUtc), CsvTime(r.SignalBarUtc),
                 Csv(r.SignalClose), Csv(r.Upper), Csv(r.Middle), Csv(r.Lower),
                 CsvTime(r.SubmitUtc), CsvTime(r.FillUtc), Csv(r.FillPrice),
-                CsvTime(exitUtc), exitReason, Csv(exitTriggerPrice), Csv(middleAtExit), Csv(signed, "F2")
+                CsvTime(exitUtc), exitReason, Csv(exitTriggerPrice), Csv(middleAtExit), Csv(signed, "F2"),
+                CsvTime(r.CallbackUtc), CsvTime(r.CalcDoneUtc), CsvTime(r.AckUtc),
+                Ms(r.CallbackUtc, r.CalcDoneUtc), Ms(r.CalcDoneUtc, r.SubmitUtc),
+                Ms(r.SubmitUtc, r.AckUtc), Ms(r.SubmitUtc, r.FillUtc), r.RejectReason ?? ""
             };
             lock (_csvSync) _tradeBuffer.Add(string.Join(",", values));
+        }
+
+        private static string Ms(DateTime from, DateTime to)
+        {
+            return from == DateTime.MinValue || to == DateTime.MinValue
+                ? "" : (to - from).TotalMilliseconds.ToString("F1", CultureInfo.InvariantCulture);
+        }
+
+        // One row per closed bar (every checkpoint), including rejected entries.
+        private void WriteBarRow(BarCalc b, string result, string reject,
+            DateTime callbackUtc, DateTime calcDoneUtc, DateTime decisionUtc)
+        {
+            double bid, ask;
+            bool haveQuote = GetQuote(out bid, out ask);
+            DateTime now = DateTime.UtcNow;
+            string setup = _longArmed ? "LONG_ARMED" : _shortArmed ? "SHORT_ARMED" : "NONE";
+            double quoteAge = _lastQuoteUtc == DateTime.MinValue ? double.NaN : (now - _lastQuoteUtc).TotalMilliseconds;
+            var values = new List<string>
+            {
+                _runId, CsvTime(b.Utc), Csv(b.Open), Csv(b.High), Csv(b.Low), Csv(b.Close),
+                Csv(b.Upper), Csv(b.Middle), Csv(b.Lower), Csv(b.Tr), Csv(_widthEma), _barsSeen.ToString(CultureInfo.InvariantCulture),
+                setup, result, reject,
+                Csv((b.High - b.Low) / _tickSize, "F1"), Csv((b.Close - b.Open) / _tickSize, "F1"),
+                Csv((b.Close - b.Upper) / _tickSize, "F1"), Csv((b.Close - b.Lower) / _tickSize, "F1"),
+                haveQuote ? Csv(bid) : "", haveQuote ? Csv(ask) : "",
+                haveQuote ? Csv((ask - bid) / _tickSize, "F1") : "", Csv(quoteAge, "F0"),
+                CsvTime(callbackUtc), CsvTime(calcDoneUtc), CsvTime(decisionUtc),
+                Ms(callbackUtc, calcDoneUtc),
+                Ms(b.Utc.AddSeconds(BarSeconds), callbackUtc)
+            };
+            lock (_csvSync) _barBuffer.Add(string.Join(",", values));
         }
 
         private static void EnsureHeader(string path, string header)
@@ -801,20 +982,27 @@ namespace strategyTesting
         {
             lock (_flushIoLock)
             {
-                List<string> rows;
-                lock (_csvSync) rows = new List<string>(_tradeBuffer);
-                if (rows.Count == 0) return;
-                try
-                {
-                    File.AppendAllLines(_tradeCsv, rows);
-                }
-                catch (Exception ex)
-                {
-                    Log("CSV flush failed; rows retained: " + ex.Message, StrategyLoggingLevel.Error);
-                    return;
-                }
-                lock (_csvSync) _tradeBuffer.RemoveRange(0, Math.Min(rows.Count, _tradeBuffer.Count));
+                FlushBuffer(_tradeBuffer, _tradeCsv);
+                FlushBuffer(_barBuffer, _barCsv);
             }
+        }
+
+        private void FlushBuffer(List<string> buffer, string path)
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            List<string> rows;
+            lock (_csvSync) rows = new List<string>(buffer);
+            if (rows.Count == 0) return;
+            try
+            {
+                File.AppendAllLines(path, rows);
+            }
+            catch (Exception ex)
+            {
+                Log("CSV flush failed; rows retained: " + ex.Message, StrategyLoggingLevel.Error);
+                return;
+            }
+            lock (_csvSync) buffer.RemoveRange(0, Math.Min(rows.Count, buffer.Count));
         }
 
         private static string Csv(double value, string format = "F2")
