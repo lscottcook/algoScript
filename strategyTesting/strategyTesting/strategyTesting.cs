@@ -40,14 +40,7 @@ namespace strategyTesting
         [InputParameter("Bar period (seconds)", 2, 5, 600, 1, 0)]
         public int BarSeconds = 30;
 
-        [InputParameter("Keltner EMA period (middle band)", 3, 2, 200, 1, 0)]
-        public int KeltnerPeriod = 20;
-
-        [InputParameter("Keltner width multiplier", 4, 0.1, 10, 0.1, 1)]
-        public double KeltnerOffset = 1.0;
-
-        [InputParameter("True-range EMA period (width)", 7, 1, 200, 1, 0)]
-        public int AtrPeriod = 20;
+ 
 
         [InputParameter("Enable longs", 5)]
         public bool EnableLongs = true;
@@ -67,8 +60,28 @@ namespace strategyTesting
         [InputParameter("Paper quantity", 14, 1, 10, 1, 0)]
         public int PaperQuantity = 1;
 
-        [InputParameter("Starting Balance", 15)]
+
+        [InputParameter("Stoploss", 14)]
+        public int inputedStopLoss = 300;
+
+        [InputParameter("Account TakeProfit", 15)]
+        public double inputedAccountTakeProfit = 500.0;
+
+        [InputParameter("Account Stoploss)", 16)]
+        public double inputedAccountStopLoss = -300.0;
+
+
+        [InputParameter("Starting Balance", 17)]
         public double StartingBalance { get; set; }
+
+
+        private int KeltnerPeriod = 20; 
+        private double KeltnerOffset = 1.0;
+
+
+
+        [InputParameter("True-range EMA period (width)", 7, 1, 200, 1, 0)]
+        public int AtrPeriod = 20;
 
         private readonly object _sync = new object();
         private readonly object _csvSync = new object();
@@ -97,6 +110,11 @@ namespace strategyTesting
 
         // Latest quote seen (receive time is local; the feed gives no quote timestamp we rely on).
         private double _lastBid = double.NaN, _lastAsk = double.NaN, _lastTradePrice;
+        private int stopLoss; // stop distance in ticks = inputedStopLoss * PaperQuantity, set in OnRun
+        private double accountTakeProfit;
+        private double accountStopLoss;
+        private double _baselineBalance;
+        private bool _accountLimitLogged;
         private DateTime _lastQuoteUtc = DateTime.MinValue;
 
         private string _barCsv;
@@ -179,6 +197,9 @@ namespace strategyTesting
 
             _lastBid = _lastAsk = double.NaN;
             _lastQuoteUtc = DateTime.MinValue;
+            _accountLimitLogged = false;
+            // If no Starting Balance is entered, account P&L is measured from the balance at start.
+            _baselineBalance = CurrentAccount != null ? CurrentAccount.Balance : 0;
             _longArmed = _shortArmed = false;
             if (!LoadHistory()) return;
 
@@ -208,9 +229,14 @@ namespace strategyTesting
             _flushTimer.Start();
 
             Log($"Keltner re-entry started for {CurrentSymbol.Name}: {BarSeconds}-sec bars, KC(EMA {KeltnerPeriod}, TR-EMA {AtrPeriod} x {KeltnerOffset}). " +
-                $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. No stop loss.",
+                $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. Stop loss {inputedStopLoss} x qty {PaperQuantity} = {inputedStopLoss * PaperQuantity} ticks.",
                 StrategyLoggingLevel.Info);
             Log($"Trades: {_tradeCsv}", StrategyLoggingLevel.Info);
+
+
+            stopLoss = inputedStopLoss * PaperQuantity;
+            accountTakeProfit = inputedAccountTakeProfit * PaperQuantity;
+            accountStopLoss = inputedAccountStopLoss * PaperQuantity;
         }
 
         protected override void OnStop()
@@ -462,9 +488,11 @@ namespace strategyTesting
                 $"(U {b.Upper:F2} / frozen target M {b.Middle:F2} / L {b.Lower:F2}).", StrategyLoggingLevel.Trading);
 
             // Entry gate: buy only if ask is still below the target; sell only if bid is still above it.
-            double bid, ask;
+            double bid = double.NaN, ask = double.NaN;
             string reject = "";
-            if (!GetQuote(out bid, out ask)) reject = "no_quote";
+            string limitReason = AccountLimitReason();
+            if (limitReason.Length > 0) reject = limitReason;
+            else if (!GetQuote(out bid, out ask)) reject = "no_quote";
             else if (side == Side.Buy && !(ask < b.Middle)) reject = "ask_not_below_target";
             else if (side == Side.Sell && !(bid > b.Middle)) reject = "bid_not_above_target";
 
@@ -509,6 +537,40 @@ namespace strategyTesting
             }
         }
 
+        // Account P&L since the baseline balance (realized). Used only to block NEW entries;
+        // open positions are still managed by the target, stop loss and session close.
+        private double AccountPnl()
+        {
+            if (CurrentAccount == null) return double.NaN;
+            double baseline = StartingBalance > 0 ? StartingBalance : _baselineBalance;
+            return CurrentAccount.Balance - baseline;
+        }
+
+        // Returns "" when new entries are allowed, else the reason they are blocked.
+        private string AccountLimitReason()
+        {
+            double pnl = AccountPnl();
+            if (double.IsNaN(pnl)) return "";
+            if (accountTakeProfit > 0 && pnl >= accountTakeProfit)
+            {
+                if (!_accountLimitLogged)
+                    Log($"Account take profit reached (P&L {pnl:F2} >= {accountTakeProfit:F2}); no new entries.",
+                        StrategyLoggingLevel.Info);
+                _accountLimitLogged = true;
+                return "account_take_profit_hit";
+            }
+            if (accountStopLoss != 0 && pnl <= -Math.Abs(accountStopLoss))
+            {
+                if (!_accountLimitLogged)
+                    Log($"Account stop loss reached (P&L {pnl:F2} <= {-Math.Abs(accountStopLoss):F2}); no new entries.",
+                        StrategyLoggingLevel.Info);
+                _accountLimitLogged = true;
+                return "account_stop_loss_hit";
+            }
+            _accountLimitLogged = false;
+            return "";
+        }
+
         private void CheckExit()
         {
             if (_paperPosition == null || _exitRequested || _openRecord == null) return;
@@ -529,21 +591,27 @@ namespace strategyTesting
             }
             else return;
 
-            bool hit = isLong ? trigger >= target : trigger <= target;
-            if (!hit) return;
+            // Stop loss (ticks from the fill price) is checked first; it wins if both are somehow true.
+            double entry = double.IsNaN(_openRecord.FillPrice) ? _paperPosition.OpenPrice : _openRecord.FillPrice;
+            bool stopHit = stopLoss > 0 && entry > 0 &&
+                (isLong ? trigger <= entry - stopLoss * _tickSize
+                        : trigger >= entry + stopLoss * _tickSize);
+            bool targetHit = isLong ? trigger >= target : trigger <= target;
+            if (!stopHit && !targetHit) return;
+            string reason = (stopHit ? "STOP_LOSS_" : "FROZEN_TARGET_") + basis;
 
             _exitRequested = true;
             TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
             if (result.Status == TradingOperationResultStatus.Success)
             {
-                Log($"PAPER exit requested at frozen target: {basis} {trigger:F2}, target {target:F2}; signal={_paperSignalId}",
-                    StrategyLoggingLevel.Trading);
-                WriteTradeRow(_openRecord, DateTime.UtcNow, "FROZEN_TARGET_" + basis, trigger, target);
+                Log($"PAPER exit requested ({(stopHit ? "STOP LOSS" : "frozen target")}): {basis} {trigger:F2}, " +
+                    $"entry {entry:F2}, target {target:F2}; signal={_paperSignalId}", StrategyLoggingLevel.Trading);
+                WriteTradeRow(_openRecord, DateTime.UtcNow, reason, trigger, target);
             }
             else
             {
                 _exitRequested = false;
-                Log("PAPER target exit failed: " + result.Message, StrategyLoggingLevel.Error);
+                Log("PAPER exit failed: " + result.Message, StrategyLoggingLevel.Error);
             }
         }
 
