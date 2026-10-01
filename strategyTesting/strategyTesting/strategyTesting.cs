@@ -52,6 +52,15 @@ namespace strategyTesting
         [InputParameter("Close all positions at 4:00 PM ET", 11)]
         public bool FlattenAtClose = true;
 
+        [InputParameter("Progress check after (minutes, 0=off)", 20, 0, 1440, 1, 0)]
+        public int ProgressCheckMinutes = 45;
+
+        [InputParameter("Progress recheck every (seconds)", 21, 1, 3600, 1, 0)]
+        public int ProgressCheckSeconds = 30;
+
+        [InputParameter("Minimum current progress to target (%)", 22, 0, 100, 1, 0)]
+        public double MinProgressPct = 25;
+
         [InputParameter("Enable PAPER orders", 12)]
         public bool EnablePaperOrders = true;
 
@@ -114,6 +123,7 @@ namespace strategyTesting
         private int stopLoss; // stop distance in ticks = inputedStopLoss * PaperQuantity, set in OnRun
         private double accountTakeProfit;
         private double accountStopLoss;
+        private DateTime _nextProgressCheckUtc = DateTime.MinValue;
         private DateTime _nextFlattenUtc = DateTime.MinValue;
         private DateTime _exitRequestedUtc = DateTime.MinValue;
         private double _baselineBalance;
@@ -574,6 +584,44 @@ namespace strategyTesting
             return "";
         }
 
+        // Progress stop: after ProgressCheckMinutes in the trade, then every ProgressCheckSeconds,
+        // close if current progress toward the frozen target is below MinProgressPct.
+        private void CheckProgressStop(DateTime nowUtc)
+        {
+            if (ProgressCheckMinutes <= 0 || _paperPosition == null || _exitRequested || _openRecord == null ||
+                _openRecord.FillUtc == DateTime.MinValue) return;
+            if ((nowUtc - _openRecord.FillUtc).TotalMinutes < ProgressCheckMinutes) return;
+            if (nowUtc < _nextProgressCheckUtc) return;
+            _nextProgressCheckUtc = nowUtc.AddSeconds(Math.Max(1, ProgressCheckSeconds));
+
+            bool isLong = _paperPosition.Side == Side.Buy;
+            double bid, ask;
+            double exitPx = GetQuote(out bid, out ask) ? (isLong ? bid : ask)
+                : (_lastTradePrice > 0 ? _lastTradePrice : double.NaN);
+            if (double.IsNaN(exitPx)) return; // no price to judge; try again next interval
+
+            // Current progress = how far the exit-side price is from entry toward the frozen target.
+            double entry = double.IsNaN(_openRecord.FillPrice) ? _paperPosition.OpenPrice : _openRecord.FillPrice;
+            double distance = Math.Abs(_openRecord.Middle - entry);
+            double progress = distance > 0 ? (isLong ? exitPx - entry : entry - exitPx) / distance : 1.0;
+            if (progress >= MinProgressPct / 100.0) return;
+
+            _exitRequested = true;
+            _exitRequestedUtc = nowUtc;
+            TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
+            if (result.Status == TradingOperationResultStatus.Success)
+            {
+                Log($"PAPER progress-stop exit: progress {progress:P0} < {MinProgressPct:F0}% after " +
+                    $"{(nowUtc - _openRecord.FillUtc).TotalMinutes:F1} min; signal={_paperSignalId}", StrategyLoggingLevel.Trading);
+                WriteTradeRow(_openRecord, nowUtc, "PROGRESS_STOP", exitPx, _openRecord.Middle);
+            }
+            else
+            {
+                _exitRequested = false;
+                Log("PAPER progress-stop exit failed: " + result.Message, StrategyLoggingLevel.Error);
+            }
+        }
+
         private void CheckExit()
         {
             if (_paperPosition == null || _exitRequested || _openRecord == null) return;
@@ -627,6 +675,7 @@ namespace strategyTesting
             {
                 if (_stopping) return;
                 HandleClosedPeriod(nowUtc);
+                CheckProgressStop(nowUtc);
                 ReconcileOrphanedPositions(nowUtc);
             }
         }
@@ -706,6 +755,7 @@ namespace strategyTesting
                     _paperPosition = position;
                     _paperEntryPending = false;
                     _exitRequested = false;
+                    _nextProgressCheckUtc = DateTime.MinValue;
                     if (_openRecord != null)
                     {
                         _openRecord.FillUtc = DateTime.UtcNow;
