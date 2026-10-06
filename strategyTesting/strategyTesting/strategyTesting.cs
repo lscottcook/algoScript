@@ -71,7 +71,7 @@ namespace strategyTesting
 
 
         [InputParameter("Stoploss", 14)]
-        public int inputedStopLoss = 50;
+        public int stopLoss = 150;
 
         [InputParameter("Account TakeProfit", 15)]
         public double inputedAccountTakeProfit = 800.0;
@@ -119,7 +119,7 @@ namespace strategyTesting
 
         // Latest quote seen (receive time is local; the feed gives no quote timestamp we rely on).
         private double _lastBid = double.NaN, _lastAsk = double.NaN, _lastTradePrice;
-        private int stopLoss; // stop distance in ticks = inputedStopLoss * PaperQuantity, set in OnRun
+
         private double accountTakeProfit;
         private double accountStopLoss;
         private DateTime _nextProgressCheckUtc = DateTime.MinValue;
@@ -256,12 +256,12 @@ namespace strategyTesting
             _flushTimer.Start();
 
             Log($"Keltner re-entry started for {CurrentSymbol.Name}: {BarSeconds}-sec bars, KC(EMA {KeltnerPeriod}, TR-EMA {AtrPeriod} x {KeltnerOffset}). " +
-                $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. Stop loss {inputedStopLoss} x qty {PaperQuantity} = {inputedStopLoss * PaperQuantity} ticks.",
+                $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. Stop loss {stopLoss} x qty {PaperQuantity} = {stopLoss * PaperQuantity} ticks.",
                 StrategyLoggingLevel.Info);
             Log($"Trades: {_tradeCsv}", StrategyLoggingLevel.Info);
 
 
-            stopLoss = inputedStopLoss * PaperQuantity;
+            stopLoss = stopLoss * PaperQuantity;
             accountTakeProfit = inputedAccountTakeProfit * PaperQuantity;
             accountStopLoss = inputedAccountStopLoss * PaperQuantity;
         }
