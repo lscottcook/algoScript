@@ -41,7 +41,6 @@ namespace strategyTesting
         [InputParameter("Bar period (seconds)", 2, 5, 600, 1, 0)]
         public int BarSeconds = 30;
 
- 
 
         [InputParameter("Enable longs", 5)]
         public bool EnableLongs = true;
@@ -72,7 +71,7 @@ namespace strategyTesting
 
 
         [InputParameter("Stoploss", 14)]
-        public int inputedStopLoss = 300;
+        public int inputedStopLoss = 50;
 
         [InputParameter("Account TakeProfit", 15)]
         public double inputedAccountTakeProfit = 800.0;
@@ -168,11 +167,13 @@ namespace strategyTesting
             public DateTime ExitUtc = DateTime.MinValue, ExitFillUtc = DateTime.MinValue, ClosedUtc = DateTime.MinValue;
             public string ExitReason = "";
             public double ExitTrigger = double.NaN, TargetAtExit = double.NaN, PeakProgress = double.NaN;
+            public double MfePoints = double.NaN, MaePoints = double.NaN;
             public double ExitFillQty, ExitFillNotional, NetPnl = double.NaN, Fee = double.NaN;
         }
 
         private readonly List<TradeRecord> _pendingRecords = new List<TradeRecord>();
         private double _peakProgress;
+        private double _mfePoints, _maePoints; // max favorable / adverse excursion (points, both >= 0)
         private bool _tradePropsLogged;
 
         public strategyTesting()
@@ -211,7 +212,7 @@ namespace strategyTesting
             EnsureHeader(_tradeCsv,
                 "runId,signalId,side,setupBarUtc,signalBarUtc,signalClose,upper,frozenTarget,lower," +
                 "submitUtc,fillUtc,fillPrice,exitUtc,exitReason,exitTriggerPrice,exitFillPrice,exitFillUtc,exitFillQty," +
-                "targetAtExit,peakProgress,signedPointsTrigger,signedPointsFill,netPnl,fee," +
+                "targetAtExit,peakProgress,mfeTicks,maeTicks,signedTicksTrigger,signedTicksFill,netPnl,fee," +
                 "barCallbackUtc,calcDoneUtc,ackUtc,calcMs,submitLagMs,ackMs,fillMs,rejectReason");
             _barCsv = Path.Combine(downloads, "strategyTesting_keltner_bars.csv");
             EnsureHeader(_barCsv,
@@ -670,6 +671,10 @@ namespace strategyTesting
                 double progressNow = (isLong ? trigger - entry : entry - trigger) / distance;
                 if (progressNow > _peakProgress) _peakProgress = progressNow;
             }
+            // MFE / MAE in points from the fill, measured on the exit-side price (bid for longs, ask for shorts).
+            double moved = isLong ? trigger - entry : entry - trigger;
+            if (moved > _mfePoints) _mfePoints = moved;
+            if (-moved > _maePoints) _maePoints = -moved;
             bool stopHit = stopLoss > 0 && entry > 0 &&
                 (isLong ? trigger <= entry - stopLoss * _tickSize
                         : trigger >= entry + stopLoss * _tickSize);
@@ -784,6 +789,7 @@ namespace strategyTesting
                     _exitRequested = false;
                     _nextProgressCheckUtc = DateTime.MinValue;
                     _peakProgress = 0;
+                    _mfePoints = _maePoints = 0;
                     if (_openRecord != null)
                     {
                         _openRecord.PositionId = position.Id;
@@ -960,7 +966,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 8,  0, 15,  30),
+                ( 8,  45, 15,  30),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
@@ -1118,6 +1124,8 @@ namespace strategyTesting
             r.ExitTrigger = trigger;
             r.TargetAtExit = target;
             r.PeakProgress = _peakProgress;
+            r.MfePoints = _mfePoints;
+            r.MaePoints = _maePoints;
         }
 
         // Writes closed trades once their exit fills have had time to arrive (or immediately when forced).
@@ -1126,7 +1134,7 @@ namespace strategyTesting
             for (int i = _pendingRecords.Count - 1; i >= 0; i--)
             {
                 TradeRecord r = _pendingRecords[i];
-                if (!force && (nowUtc - r.ClosedUtc).TotalSeconds < 2) continue;
+                if (!force && (nowUtc - r.ClosedUtc).TotalSeconds < 5) continue;
                 _pendingRecords.RemoveAt(i);
                 WriteTradeRow(r);
             }
@@ -1145,8 +1153,7 @@ namespace strategyTesting
             lock (_sync)
             {
                 if (_stopping || t == null) return;
-                TradeRecord r = FindRecord(t.PositionId);
-                if (r == null) return;
+                if (!IsOurAccount(t.Account) || !IsOurSymbol(t.Symbol)) return;
 
                 if (!_tradePropsLogged)
                 {
@@ -1156,11 +1163,31 @@ namespace strategyTesting
                         StrategyLoggingLevel.Info);
                 }
 
+                // Match by position id; if the broker's id differs, fall back to the trade we are managing
+                // (open record) or one that closed in the last 10 seconds.
+                TradeRecord r = FindRecord(t.PositionId);
+                string matchedBy = "positionId";
+                if (r == null)
+                {
+                    matchedBy = "fallback";
+                    r = _openRecord != null && _openRecord.FillUtc != DateTime.MinValue
+                        ? _openRecord
+                        : _pendingRecords.LastOrDefault(p => (DateTime.UtcNow - p.ClosedUtc).TotalSeconds < 10);
+                }
+
+                object sideObj = Prop(t, "Side");
+                bool sideKnown = sideObj is Side;
+                Log($"Trade event: order={t.OrderId} position={t.PositionId} side={sideObj} price={t.Price:F4} " +
+                    $"qty={t.Quantity} matched={(r == null ? "none" : matchedBy)}", StrategyLoggingLevel.Info);
+                if (r == null) return;
+
                 double fee = PnlNumber(t, "Fee");
                 if (!double.IsNaN(fee)) r.Fee = (double.IsNaN(r.Fee) ? 0 : r.Fee) + fee;
 
-                object sideObj = Prop(t, "Side");
-                if (sideObj is Side && (Side)sideObj == r.Side) return; // entry-side fill
+                // Exit fill = opposite side to the entry; if side is unreadable, only count it once an exit is underway.
+                bool isExit = sideKnown ? (Side)sideObj != r.Side
+                                        : (r != _openRecord || _exitRequested);
+                if (!isExit) return;
 
                 r.ExitFillQty += t.Quantity;
                 r.ExitFillNotional += t.Price * t.Quantity;
@@ -1203,7 +1230,9 @@ namespace strategyTesting
                 CsvTime(r.SubmitUtc), CsvTime(r.FillUtc), Csv(r.FillPrice),
                 CsvTime(r.ExitUtc), r.ExitReason, Csv(r.ExitTrigger), Csv(exitFill), CsvTime(r.ExitFillUtc),
                 r.ExitFillQty > 0 ? r.ExitFillQty.ToString(CultureInfo.InvariantCulture) : "",
-                Csv(r.TargetAtExit), Csv(r.PeakProgress), Csv(pointsTrigger), Csv(pointsFill),
+                Csv(r.TargetAtExit), Csv(r.PeakProgress),
+                Csv(r.MfePoints / _tickSize, "F1"), Csv(r.MaePoints / _tickSize, "F1"),
+                Csv(pointsTrigger / _tickSize, "F1"), Csv(pointsFill / _tickSize, "F1"),
                 Csv(r.NetPnl), Csv(r.Fee),
                 CsvTime(r.CallbackUtc), CsvTime(r.CalcDoneUtc), CsvTime(r.AckUtc),
                 Ms(r.CallbackUtc, r.CalcDoneUtc), Ms(r.CalcDoneUtc, r.SubmitUtc),
