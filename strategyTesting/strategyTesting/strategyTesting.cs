@@ -210,15 +210,15 @@ namespace strategyTesting
                 Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
             _tradeCsv = Path.Combine(downloads, "strategyTesting_keltner_trades.csv");
             EnsureHeader(_tradeCsv,
-                "runId,signalId,side,setupBarUtc,signalBarUtc,signalClose,upper,frozenTarget,lower," +
-                "submitUtc,fillUtc,fillPrice,exitUtc,exitReason,exitTriggerPrice,exitFillPrice,exitFillUtc,exitFillQty," +
+                "runId,signalId,side,setupBarEst,signalBarEst,signalClose,upper,frozenTarget,lower," +
+                "submitEst,fillEst,fillPrice,exitEst,exitReason,exitTriggerPrice,exitFillPrice,exitFillEst,exitFillQty," +
                 "targetAtExit,peakProgress,mfeTicks,maeTicks,signedTicksTrigger,signedTicksFill,netPnl,fee," +
-                "barCallbackUtc,calcDoneUtc,ackUtc,calcMs,submitLagMs,ackMs,fillMs,rejectReason,symbol");
+                "barCallbackEst,calcDoneEst,ackEst,calcMs,submitLagMs,ackMs,fillMs,rejectReason,openDuration,symbol");
             _barCsv = Path.Combine(downloads, "strategyTesting_keltner_bars.csv");
             EnsureHeader(_barCsv,
-                "runId,barUtc,open,high,low,close,upper,middle,lower,trueRange,widthEma,barsSeen," +
+                "runId,barEst,open,high,low,close,upper,middle,lower,trueRange,widthEma,barsSeen," +
                 "setupState,result,rejectReason,heightTicks,bodyTicks,closeUpperTicks,closeLowerTicks," +
-                "bid,ask,spreadTicks,quoteAgeMs,callbackUtc,calcDoneUtc,decisionUtc,calcMs,callbackLagMs,symbol");
+                "bid,ask,spreadTicks,quoteAgeMs,callbackEst,calcDoneEst,decisionEst,calcMs,callbackLagMs,symbol");
 
             _lastBid = _lastAsk = double.NaN;
             _lastQuoteUtc = DateTime.MinValue;
@@ -996,7 +996,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 6,  45, 12,  30),
+                ( 8,  45, 12,  30),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
@@ -1267,9 +1267,19 @@ namespace strategyTesting
                 CsvTime(r.CallbackUtc), CsvTime(r.CalcDoneUtc), CsvTime(r.AckUtc),
                 Ms(r.CallbackUtc, r.CalcDoneUtc), Ms(r.CalcDoneUtc, r.SubmitUtc),
                 Ms(r.SubmitUtc, r.AckUtc), Ms(r.SubmitUtc, r.FillUtc), r.RejectReason ?? "",
+                OpenDuration(r.FillUtc, r.ExitFillUtc != DateTime.MinValue ? r.ExitFillUtc : r.ExitUtc),
                 CurrentSymbol != null ? CurrentSymbol.Name : ""
             };
             lock (_csvSync) _tradeBuffer.Add(string.Join(",", values));
+        }
+
+        // Time the position was open as "minutes:seconds.milliseconds" (minutes are total, e.g. 75:03.250).
+        private static string OpenDuration(DateTime fill, DateTime exit)
+        {
+            if (fill == DateTime.MinValue || exit == DateTime.MinValue || exit < fill) return "";
+            TimeSpan d = exit - fill;
+            return string.Format(CultureInfo.InvariantCulture, "{0}:{1:00}.{2:000}",
+                (long)d.TotalMinutes, d.Seconds, d.Milliseconds);
         }
 
         private static string Ms(DateTime from, DateTime to)
@@ -1357,7 +1367,7 @@ namespace strategyTesting
         private static string CsvTime(DateTime value)
         {
             return value == DateTime.MinValue
-                ? "" : value.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+                ? "" : ToEastern(value).ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
         }
 
         private static readonly TimeZoneInfo Eastern =
