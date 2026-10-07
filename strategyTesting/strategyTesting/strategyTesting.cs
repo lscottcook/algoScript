@@ -70,11 +70,11 @@ namespace strategyTesting
         public int PaperQuantity = 1;
 
 
-        [InputParameter("Stoploss", 14)]
-        public int stopLoss = 150;
+        // Stop loss in ticks per contract; chosen by base symbol in OnRun (see StopLossForSymbol).
+        private int stopLoss;
 
         [InputParameter("Account TakeProfit", 15)]
-        public double inputedAccountTakeProfit = 800.0;
+        public double inputedAccountTakeProfit = 100.0;
 
         [InputParameter("Account Stoploss)", 16)]
         public double inputedAccountStopLoss = -400.0;
@@ -213,12 +213,12 @@ namespace strategyTesting
                 "runId,signalId,side,setupBarUtc,signalBarUtc,signalClose,upper,frozenTarget,lower," +
                 "submitUtc,fillUtc,fillPrice,exitUtc,exitReason,exitTriggerPrice,exitFillPrice,exitFillUtc,exitFillQty," +
                 "targetAtExit,peakProgress,mfeTicks,maeTicks,signedTicksTrigger,signedTicksFill,netPnl,fee," +
-                "barCallbackUtc,calcDoneUtc,ackUtc,calcMs,submitLagMs,ackMs,fillMs,rejectReason");
+                "barCallbackUtc,calcDoneUtc,ackUtc,calcMs,submitLagMs,ackMs,fillMs,rejectReason,symbol");
             _barCsv = Path.Combine(downloads, "strategyTesting_keltner_bars.csv");
             EnsureHeader(_barCsv,
                 "runId,barUtc,open,high,low,close,upper,middle,lower,trueRange,widthEma,barsSeen," +
                 "setupState,result,rejectReason,heightTicks,bodyTicks,closeUpperTicks,closeLowerTicks," +
-                "bid,ask,spreadTicks,quoteAgeMs,callbackUtc,calcDoneUtc,decisionUtc,calcMs,callbackLagMs");
+                "bid,ask,spreadTicks,quoteAgeMs,callbackUtc,calcDoneUtc,decisionUtc,calcMs,callbackLagMs,symbol");
 
             _lastBid = _lastAsk = double.NaN;
             _lastQuoteUtc = DateTime.MinValue;
@@ -254,6 +254,8 @@ namespace strategyTesting
             _flushTimer = new System.Timers.Timer(5000) { AutoReset = true };
             _flushTimer.Elapsed += (s, e) => Flush();
             _flushTimer.Start();
+
+            stopLoss = StopLossForSymbol(CurrentSymbol);
 
             Log($"Keltner re-entry started for {CurrentSymbol.Name}: {BarSeconds}-sec bars, KC(EMA {KeltnerPeriod}, TR-EMA {AtrPeriod} x {KeltnerOffset}). " +
                 $"Longs={EnableLongs}, Shorts={EnableShorts}. Mode={(EnablePaperOrders ? "PAPER REQUESTED" : "SHADOW")}. Stop loss {stopLoss} x qty {PaperQuantity} = {stopLoss * PaperQuantity} ticks.",
@@ -891,9 +893,37 @@ namespace strategyTesting
         private bool IsOurSymbol(Symbol symbol)
         {
             if (symbol == null || CurrentSymbol == null) return false;
-            if (ReferenceEquals(symbol, CurrentSymbol) || symbol.Id == CurrentSymbol.Id) return true;
-            return !string.IsNullOrEmpty(symbol.Root) && !string.IsNullOrEmpty(CurrentSymbol.Root)
-                && string.Equals(symbol.Root, CurrentSymbol.Root, StringComparison.OrdinalIgnoreCase);
+            // Match on the base symbol only (e.g. "NQ", "MNQ", "ES"), never the contract month/year,
+            // so a roll or a different contract id can't cause a mismatch, and a strategy running on a
+            // different symbol is never treated as ours.
+            string key = BaseSymbol(symbol);
+            return key.Length > 0 && string.Equals(key, BaseSymbol(CurrentSymbol), StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Stop loss (ticks, per contract) by base symbol; micro and full-size share a value.
+        private static int StopLossForSymbol(Symbol symbol)
+        {
+            switch (BaseSymbol(symbol).ToUpperInvariant())
+            {
+                case "GC": case "MGC": return 40;
+                case "NQ": case "MNQ": return 100;
+                case "ES": case "MES": return 40;
+                case "HG": case "MHG": return 30;
+                default: return 150;
+            }
+        }
+
+        private static string BaseSymbol(Symbol symbol)
+        {
+            if (!string.IsNullOrEmpty(symbol.Root)) return symbol.Root.Trim();
+
+            // Fallback: strip the exchange suffix, contract year digits and month code from the name.
+            string name = symbol.Name ?? "";
+            int dot = name.IndexOfAny(new[] { '.', ' ', '/' });
+            if (dot > 0) name = name.Substring(0, dot);
+            name = name.TrimEnd('0', '1', '2', '3', '4', '5', '6', '7', '8', '9');
+            if (name.Length > 3) name = name.Substring(0, name.Length - 1);
+            return name;
         }
 
         // ------------------------------------------------------------------
@@ -966,7 +996,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 8,  45, 15,  30),
+                ( 6,  45, 12,  30),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
@@ -1236,7 +1266,8 @@ namespace strategyTesting
                 Csv(r.NetPnl), Csv(r.Fee),
                 CsvTime(r.CallbackUtc), CsvTime(r.CalcDoneUtc), CsvTime(r.AckUtc),
                 Ms(r.CallbackUtc, r.CalcDoneUtc), Ms(r.CalcDoneUtc, r.SubmitUtc),
-                Ms(r.SubmitUtc, r.AckUtc), Ms(r.SubmitUtc, r.FillUtc), r.RejectReason ?? ""
+                Ms(r.SubmitUtc, r.AckUtc), Ms(r.SubmitUtc, r.FillUtc), r.RejectReason ?? "",
+                CurrentSymbol != null ? CurrentSymbol.Name : ""
             };
             lock (_csvSync) _tradeBuffer.Add(string.Join(",", values));
         }
@@ -1267,7 +1298,8 @@ namespace strategyTesting
                 haveQuote ? Csv((ask - bid) / _tickSize, "F1") : "", Csv(quoteAge, "F0"),
                 CsvTime(callbackUtc), CsvTime(calcDoneUtc), CsvTime(decisionUtc),
                 Ms(callbackUtc, calcDoneUtc),
-                Ms(b.Utc.AddSeconds(BarSeconds), callbackUtc)
+                Ms(b.Utc.AddSeconds(BarSeconds), callbackUtc),
+                CurrentSymbol != null ? CurrentSymbol.Name : ""
             };
             lock (_csvSync) _barBuffer.Add(string.Join(",", values));
         }
