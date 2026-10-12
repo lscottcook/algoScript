@@ -74,10 +74,10 @@ namespace strategyTesting
         private int stopLoss;
 
         [InputParameter("Account TakeProfit", 15)]
-        public double inputedAccountTakeProfit = 100.0;
+        public double inputedAccountTakeProfit = 500.0;
 
         [InputParameter("Account Stoploss)", 16)]
-        public double inputedAccountStopLoss = -400.0;
+        public double inputedAccountStopLoss = -450.0;
 
 
         [InputParameter("Starting Balance", 25)]
@@ -996,7 +996,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 8,  45, 12,  30),
+                ( 8,  45, 15,  30),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
