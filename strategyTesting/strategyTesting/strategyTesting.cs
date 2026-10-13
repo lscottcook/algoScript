@@ -529,6 +529,7 @@ namespace strategyTesting
             else if (!GetQuote(out bid, out ask)) reject = "no_quote";
             else if (side == Side.Buy && !(ask < b.Middle)) reject = "ask_not_below_target";
             else if (side == Side.Sell && !(bid > b.Middle)) reject = "bid_not_above_target";
+            else if (TargetTooClose(side, b.Middle, bid, ask)) reject = "target_too_close";
 
             if (reject.Length == 0 && !TryPlacePaperOrder(record))
                 reject = record.RejectReason.Length > 0 ? record.RejectReason : "entry_refused";
@@ -909,8 +910,41 @@ namespace strategyTesting
                 case "NQ": case "MNQ": return 100;
                 case "ES": case "MES": return 40;
                 case "HG": case "MHG": return 30;
+                case "ZN": case "MZN": return 20;
                 default: return 150;
             }
+        }
+
+        // Round-trip fee (USD, per contract) by base symbol, taken from observed broker fees.
+        // NaN = unknown, which leaves the target-distance filter off for that symbol.
+        private static double RoundTripFeeForSymbol(Symbol symbol)
+        {
+            switch (BaseSymbol(symbol).ToUpperInvariant())
+            {
+                case "MNQ": case "MES": return 0.36;
+                case "MGC": case "MHG": return 0.71;
+                case "SIL": return 1.11;
+                case "ZN": return 0.81;
+                default: return double.NaN;
+            }
+        }
+
+        // True when hitting the frozen target would net zero or less after the round-trip fee
+        // (gross <= fee). Distance is measured from the price we would enter at (ask for buys,
+        // bid for sells) to the first tradable price at/through the target.
+        private bool TargetTooClose(Side side, double target, double bid, double ask)
+        {
+            if (!(_tickSize > 0)) return false;
+            double fee = RoundTripFeeForSymbol(CurrentSymbol);
+            if (double.IsNaN(fee)) return false;
+
+            double entry = side == Side.Buy ? ask : bid;
+            double points = side == Side.Buy ? target - entry : entry - target;
+            double ticks = Math.Ceiling(Math.Round(points / _tickSize, 6));
+            double tickCost = CurrentSymbol.GetTickCost(entry);
+            if (!(tickCost > 0)) return false;
+
+            return ticks * tickCost <= fee;
         }
 
         private static string BaseSymbol(Symbol symbol)
