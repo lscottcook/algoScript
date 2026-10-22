@@ -77,7 +77,7 @@ namespace strategyTesting
         public double inputedAccountTakeProfit = 500.0;
 
         [InputParameter("Account Stoploss)", 16)]
-        public double inputedAccountStopLoss = -450.0;
+        public double inputedAccountStopLoss = -200.0;
 
 
         [InputParameter("Starting Balance", 25)]
@@ -910,7 +910,9 @@ namespace strategyTesting
                 case "NQ": case "MNQ": return 100;
                 case "ES": case "MES": return 40;
                 case "HG": case "MHG": return 30;
-                case "ZN": case "MZN": return 20;
+                case "ZN": case "MZN": return 10;
+                case "SI": case "SIL": return 15;
+
                 default: return 150;
             }
         }
@@ -1030,7 +1032,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 8,  45, 15,  30),
+                ( 9,  30, 10,  0),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
