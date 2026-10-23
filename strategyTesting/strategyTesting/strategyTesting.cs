@@ -127,6 +127,7 @@ namespace strategyTesting
         private DateTime _exitRequestedUtc = DateTime.MinValue;
         private double _baselineBalance;
         private bool _accountLimitLogged;
+        private bool _accountStopLogged;
         private DateTime _lastQuoteUtc = DateTime.MinValue;
 
         private string _barCsv;
@@ -573,13 +574,43 @@ namespace strategyTesting
             }
         }
 
-        // Account P&L since the baseline balance (realized). Used only to block NEW entries;
-        // open positions are still managed by the target, stop loss and session close.
+        // Account P&L since the baseline balance: realized balance change plus the open P&L of our
+        // positions. Blocks NEW entries and triggers the account stop-loss flatten.
         private double AccountPnl()
         {
             if (CurrentAccount == null) return double.NaN;
             double baseline = StartingBalance > 0 ? StartingBalance : _baselineBalance;
-            return CurrentAccount.Balance - baseline;
+            return CurrentAccount.Balance - baseline + OpenPnl();
+        }
+
+        // Net P&L of open positions on our account/symbol (what closing them at the current price would make).
+        private double OpenPnl()
+        {
+            double total = 0;
+            foreach (Position p in Core.Instance.Positions.Where(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol)))
+            {
+                double pnl = PnlNumber(p, "NetPnL");
+                if (!double.IsNaN(pnl)) total += pnl;
+            }
+            return total;
+        }
+
+        // If account P&L (realized + open) has hit the account stop loss, close every position and
+        // cancel working orders. Re-checked every tick and by the housekeeping timer until flat.
+        private void CheckAccountStop(DateTime nowUtc)
+        {
+            if (accountStopLoss == 0) return;
+            double pnl = AccountPnl();
+            if (double.IsNaN(pnl) || pnl > -Math.Abs(accountStopLoss))
+            {
+                _accountStopLogged = false;
+                return;
+            }
+            if (!_accountStopLogged)
+                Log($"Account stop loss reached (P&L {pnl:F2} <= {-Math.Abs(accountStopLoss):F2}); closing all positions.",
+                    StrategyLoggingLevel.Trading);
+            _accountStopLogged = true;
+            FlattenAll(nowUtc, "account stop loss", "ACCOUNT_STOP_LOSS");
         }
 
         // Returns "" when new entries are allowed, else the reason they are blocked.
@@ -647,6 +678,7 @@ namespace strategyTesting
 
         private void CheckExit()
         {
+            if (_paperPosition != null) CheckAccountStop(DateTime.UtcNow);
             if (_paperPosition == null || _exitRequested || _openRecord == null) return;
             double target = _openRecord.Middle;
             bool isLong = _paperPosition.Side == Side.Buy;
@@ -709,6 +741,7 @@ namespace strategyTesting
             {
                 if (_stopping) return;
                 HandleClosedPeriod(nowUtc);
+                CheckAccountStop(nowUtc);
                 CheckProgressStop(nowUtc);
                 FinalizePending(nowUtc, false);
                 ReconcileOrphanedPositions(nowUtc);
@@ -912,6 +945,7 @@ namespace strategyTesting
                 case "HG": case "MHG": return 30;
                 case "ZN": case "MZN": return 10;
                 case "SI": case "SIL": return 15;
+                case "CL": case "MCL": return 50;
 
                 default: return 150;
             }
@@ -927,6 +961,8 @@ namespace strategyTesting
                 case "MGC": case "MHG": return 0.71;
                 case "SIL": return 1.11;
                 case "ZN": return 0.81;
+                case "MCL": return 0.61;
+
                 default: return double.NaN;
             }
         }
@@ -984,7 +1020,7 @@ namespace strategyTesting
 
         // From 4:00 PM ET, close every position (and cancel working orders) on our account/symbol.
         // Keeps checking while the window is open, so a failed close or a late fill is retried.
-        private void FlattenAll(DateTime nowUtc)
+        private void FlattenAll(DateTime nowUtc, string label = "4:00 PM ET close", string exitReason = "SESSION_CLOSE")
         {
             if (nowUtc < _nextFlattenUtc || CurrentAccount == null || CurrentSymbol == null) return;
             List<Position> positions = Core.Instance.Positions
@@ -994,7 +1030,7 @@ namespace strategyTesting
             if (positions.Count == 0 && !working) return;
 
             _nextFlattenUtc = nowUtc.AddSeconds(5); // do not stack close orders while one is in flight
-            if (working) CancelWorkingOrders("4:00 PM ET close");
+            if (working) CancelWorkingOrders(label);
 
             foreach (Position p in positions)
             {
@@ -1005,17 +1041,17 @@ namespace strategyTesting
                 TradingOperationResult result = Core.Instance.ClosePosition(p);
                 if (result.Status == TradingOperationResultStatus.Success)
                 {
-                    Log($"4:00 PM ET close requested: position {p.Id} {p.Side} {p.Quantity}.", StrategyLoggingLevel.Trading);
+                    Log($"{label} close requested: position {p.Id} {p.Side} {p.Quantity}.", StrategyLoggingLevel.Trading);
                     if (tracked)
                     {
                         if (!_exitRequested && _openRecord != null)
-                            MarkExit(_openRecord, nowUtc, "SESSION_CLOSE", double.NaN, _openRecord.Middle);
+                            MarkExit(_openRecord, nowUtc, exitReason, double.NaN, _openRecord.Middle);
                         _exitRequested = true;
                         _exitRequestedUtc = nowUtc;
                     }
                 }
                 else
-                    Log($"4:00 PM ET close FAILED for position {p.Id}: {result.Message}. Retrying in 5s.",
+                    Log($"{label} close FAILED for position {p.Id}: {result.Message}. Retrying in 5s.",
                         StrategyLoggingLevel.Error);
             }
         }
@@ -1032,7 +1068,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 9,  30, 10,  0),
+                ( 9,  30, 15,  0),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
