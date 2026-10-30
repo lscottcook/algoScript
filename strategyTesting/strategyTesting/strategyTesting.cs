@@ -74,10 +74,10 @@ namespace strategyTesting
         private int stopLoss;
 
         [InputParameter("Account TakeProfit", 15)]
-        public double inputedAccountTakeProfit = 500.0;
+        public double inputedAccountTakeProfit = 200.0;
 
         [InputParameter("Account Stoploss)", 16)]
-        public double inputedAccountStopLoss = -200.0;
+        public double inputedAccountStopLoss = -100.0;
 
 
         [InputParameter("Starting Balance", 25)]
@@ -940,12 +940,12 @@ namespace strategyTesting
             switch (BaseSymbol(symbol).ToUpperInvariant())
             {
                 case "GC": case "MGC": return 40;
-                case "NQ": case "MNQ": return 100;
+                case "NQ": case "MNQ": return 80;
                 case "ES": case "MES": return 40;
                 case "HG": case "MHG": return 30;
                 case "ZN": case "MZN": return 10;
                 case "SI": case "SIL": return 15;
-                case "CL": case "MCL": return 50;
+                case "CL": case "MCL": return 20;
 
                 default: return 150;
             }
@@ -1068,7 +1068,7 @@ namespace strategyTesting
         {
             var windows = new (int sh, int sm, int eh, int em)[]
             {
-                ( 9,  30, 15,  0),
+                ( 9,  30, 10,  0),
             };
 
             foreach (var (sh, sm, eh, em) in windows)
