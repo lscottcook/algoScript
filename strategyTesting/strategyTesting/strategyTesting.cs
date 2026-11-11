@@ -941,7 +941,7 @@ namespace strategyTesting
             {
                 case "GC": case "MGC": return 40;
                 case "NQ": case "MNQ": return 80;
-                case "ES": case "MES": return 40;
+                case "ES": case "MES": return 20;
                 case "HG": case "MHG": return 30;
                 case "ZN": case "MZN": return 10;
                 case "SI": case "SIL": return 15;
