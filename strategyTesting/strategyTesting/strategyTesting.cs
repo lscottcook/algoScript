@@ -10,269 +10,472 @@ using TradingPlatform.BusinessLayer;
 namespace strategyTesting
 {
     /// <summary>
-    /// ADX + candle-direction strategy.
+    /// Intraday futures basket: MES, MNQ, MGC, MCL, MHG, one basket at a time, 1 contract per leg
     ///
-    /// BUY:  the last two closed 30-second candles AND the last closed 1-minute candle were
-    ///       bullish (close > open), and ADX is above 25 on both the 30-second and 1-minute
-    ///       charts -> buy LIMIT PullbackTicks below the bid (cancelled if unfilled after
-    ///       EntryTimeoutSeconds; the strategy then keeps watching for the next signal).
-    /// SELL: same, with all three candles bearish (close < open); sell LIMIT PullbackTicks above the ask.
+    /// Three attempts per day (ET). For each attempt the 15 one-minute bars before entry are
+    /// ranked by return; long the top 3, short the bottom 2 (top 2 / bottom 2 if MHG is thin and
+    /// removed). Skipped if the top-to-bottom spread is under 0.10%. All legs are entered
+    /// together at market, only if every leg's bid/ask is fresh and its spread normal (else
+    /// NO_BASKET with no orders sent); any leg unfilled after 5 minutes flattens the basket. Exits: the attempt's exit time
+    /// (TIME_EXIT), or basket P&L at or below -$250 at a 1-minute close once 5 minutes have
+    /// passed since entry time (CAP_EXIT). Daily -$500 and cumulative -$1000 kill switches.
+    /// Flat by 15:30 ET, always.
     ///
-    /// Checked each time a 30-second bar closes, while flat. Both ADX values are read from
-    /// the last CLOSED bar on their chart. +DI / -DI are not used.
-    ///
-    /// Every entry carries a server-side hard stop and take-profit (ticks from fill), and the
-    /// strategy also closes the position itself when a trade reaches either level.
+    /// Logs: Downloads\Basket_attempts.csv (one row per attempt), Basket_days.csv (one row per
+    /// trading day the strategy runs through). Nothing is saved between runs: daily and
+    /// cumulative P&L and the kill switches start at zero each time the strategy starts.
     /// </summary>
-    public class strategyTesting : Strategy, ICurrentAccount, ICurrentSymbol
+    public class strategyTesting : Strategy, ICurrentAccount
     {
-        [InputParameter("Symbol", 0)]
-        public Symbol CurrentSymbol { get; set; }
 
         [InputParameter("Account", 1)]
         public Account CurrentAccount { get; set; }
 
-        [InputParameter("Hard stop (ticks)", 8, 1, 1000, 1, 0)]
-        public int StopTicks = 7;
+        [InputParameter("MES symbol (front month)", 2)]
+        public Symbol MesSymbol { get; set; }
 
-        [InputParameter("Take profit (ticks)", 9, 1, 1000, 1, 0)]
-        public int TargetTicks = 5;
+        [InputParameter("MNQ symbol (front month)", 3)]
+        public Symbol MnqSymbol { get; set; }
 
-        [InputParameter("Pullback (ticks)", 9, 0, 100, 1, 0)]
-        public int PullbackTicks = 1;
+        [InputParameter("MGC symbol (front month)", 4)]
+        public Symbol MgcSymbol { get; set; }
 
-        [InputParameter("Entry limit timeout (seconds)", 9, 1, 60, 1, 0)]
-        public int EntryTimeoutSeconds = 3;
+        [InputParameter("MCL symbol (front month)", 5)]
+        public Symbol MclSymbol { get; set; }
 
-        [InputParameter("Paper quantity", 14, 1, 10, 1, 0)]
-        public int PaperQuantity = 1;
+        [InputParameter("MHG symbol (front month)", 6)]
+        public Symbol MhgSymbol { get; set; }
 
-        [InputParameter("Account TakeProfit", 16)]
-        public double inputedAccountTakeProfit = 200.0;
 
-        [InputParameter("Account Stoploss", 17)]
-        public double inputedAccountStopLoss = -100.0;
+        // Fees: per side, per contract, all-in. Defaults are the AMP Futures estimate.
+        // On = P&L, cap and limits use these; off = use the fee the broker reports on each fill.
+        // Both are logged either way (fees_broker / fees_estimated).
+        [InputParameter("Use estimated fees below (off = broker-reported fees)", 9)]
+        public bool UseFeeEstimates = true;
+
+        [InputParameter("MES fee per side ($)", 10, 0, 100, 0.01, 2)]
+        public double FeeMes = 0.60;
+
+        [InputParameter("MNQ fee per side ($)", 11, 0, 100, 0.01, 2)]
+        public double FeeMnq = 0.60;
+
+        [InputParameter("MGC fee per side ($)", 12, 0, 100, 0.01, 2)]
+        public double FeeMgc = 0.85;
+
+        [InputParameter("MCL fee per side ($)", 13, 0, 100, 0.01, 2)]
+        public double FeeMcl = 0.75;
+
+        [InputParameter("MHG fee per side ($)", 14, 0, 100, 0.01, 2)]
+        public double FeeMhg = 0.80;
+
 
         [InputParameter("Starting Balance", 18)]
         public double StartingBalance { get; set; }
 
+        // ------------------------------------------------------------------
+        // Constants (spec section 1)
+        // ------------------------------------------------------------------
 
+        private const int QtyPerLeg = 1;
 
+        private static readonly (string Key, double DollarsPerPoint, double SpecTick)[] SymbolSpecs =
+        {
+            ("MES", 5.00, 0.25),
+            ("MNQ", 2.00, 0.25),
+            ("MGC", 10.00, 0.10),
+            ("MCL", 100.00, 0.01),
+            ("MHG", 2500.00, 0.0005),
+        };
 
+        private sealed class AttemptSpec
+        {
+            public int Number;
+            public TimeSpan RankStart, Entry, Exit;
+        }
 
+        private static readonly AttemptSpec[] Attempts =
+        {
+            new AttemptSpec { Number = 1, RankStart = new TimeSpan(9, 15, 0),  Entry = new TimeSpan(9, 30, 0),  Exit = new TimeSpan(10, 14, 0) },
+            new AttemptSpec { Number = 2, RankStart = new TimeSpan(10, 45, 0), Entry = new TimeSpan(11, 00, 0), Exit = new TimeSpan(11, 59, 0) },
+            new AttemptSpec { Number = 3, RankStart = new TimeSpan(14, 45, 0), Entry = new TimeSpan(15, 0, 0),  Exit = new TimeSpan(15, 30, 0) },
+        };
 
+        private static readonly TimeSpan FlatBy = new TimeSpan(15, 30, 0);
 
-        private int FilterMinutes = 1;
-        private int SignalSeconds = 30;
-        private int AdxPeriod = 14;
-        private double AdxThreshold = 25;
+        private const double NoSignalMinSpreadPct = 0.10;
+        private const int MhgMinTicksInWindow = 20;
 
+        private const double MaxLossPerBasket = 250.00;
+        private const int CapActiveAfterMinutes = 5;
+        private const double MaxLossPerDay = 500.00;
+        private const double MaxCumulativeDrawdown = 1000.00;
 
+        // Pre-send check, per leg: the bid/ask must have updated within QuoteMaxAgeSeconds and the
+        // spread must be at most MaxSpreadTicks. If any leg fails, the attempt is NO_BASKET and no
+        // orders are sent. Fills are not checked afterwards (no open-then-close).
+        private const int QuoteMaxAgeSeconds = 15;
+        private const double MaxSpreadTicks = 5;
+        private const int EntryFillTimeoutMinutes = 5;
 
-        private double accountTakeProfit;
-        private double accountStopLoss;
-        private double _baselineBalance;
-        private bool _accountLimitLogged;
-        private bool _accountStopLogged;
-        private DateTime _nextFlattenUtc = DateTime.MinValue;
-        private bool _outsideHoursLogged;
+        // Wait this long after the entry minute starts so the last trades of the previous
+        // minute are in the bars. An attempt is skipped if the strategy wasn't running within
+        // EntryLateLimit of its entry time.
+        private static readonly TimeSpan EntryGrace = TimeSpan.FromSeconds(2);
+        private static readonly TimeSpan EntryLateLimit = TimeSpan.FromSeconds(60);
+
+        // ------------------------------------------------------------------
+        // Types
+        // ------------------------------------------------------------------
+
+        private sealed class Slot
+        {
+            public int Index;
+            public string Key;
+            public double DollarsPerPoint;
+            public double SpecTick;
+            public Symbol Symbol;
+            public double TickSize;
+            public double FeePerSide;
+            public HistoricalData History;
+            // Trade prints counted from NewLast, keyed by ET minute start.
+            public readonly Dictionary<DateTime, int> TradesPerMinuteEt = new Dictionary<DateTime, int>();
+            public DateTime CountingSinceEt = DateTime.MaxValue;
+            // Live bid/ask from NewQuote; QuoteTimeUtc = when it last arrived (MinValue = none yet).
+            public double QuoteBid = double.NaN, QuoteAsk = double.NaN;
+            public DateTime QuoteTimeUtc = DateTime.MinValue;
+        }
+
+        private sealed class Leg
+        {
+            public Slot Slot;
+            public Side Side;
+            public int Dir;
+            public double EntryRef;
+            public string EntryOrderId;
+            public bool OrderFailed;
+            public string FailNote = "";
+            public double EntryQty, EntryNotional, ExitQty, ExitNotional;
+            public double BrokerFees, EstimatedFees;   // both accumulated per fill
+            public bool UseEstimatedFees;
+            public double Fees => UseEstimatedFees ? EstimatedFees : BrokerFees;
+            public double ExitPriceFallback = double.NaN;
+            public DateTime MissingSinceUtc = DateTime.MinValue;
+            public double EntryFill => EntryQty > 0 ? EntryNotional / EntryQty : double.NaN;
+            public double ExitFill => ExitQty > 0 ? ExitNotional / ExitQty : ExitPriceFallback;
+            public double TouchAtSend = double.NaN;     // ask for a buy, bid for a sell, when sent
+            public string TouchSource = "";
+            // Fill vs the bid/ask at send: what the safety limit checks. Positive = worse.
+            public double TouchSlippageTicks => double.IsNaN(EntryFill) || double.IsNaN(TouchAtSend) || Slot.TickSize <= 0
+                ? double.NaN : (EntryFill - TouchAtSend) * Dir / Slot.TickSize;
+            // Fill vs entry_ref (last-minute close): logged only. Positive = worse.
+            public double SlippageTicks => double.IsNaN(EntryFill) || Slot.TickSize <= 0
+                ? double.NaN : (EntryFill - EntryRef) * Dir / Slot.TickSize;
+        }
+
+        private sealed class AttemptLog
+        {
+            public DateTime DateEt;
+            public AttemptSpec Spec;
+            public string Outcome = "";
+            public string Detail = "";
+            public readonly Dictionary<string, double> ReturnPct = new Dictionary<string, double>();
+            public readonly Dictionary<string, double> EntryRef = new Dictionary<string, double>();
+            public int MhgTicks = -1;
+            public string MhgTickSource = "";
+            public bool MhgRemoved;
+            public readonly List<string> Longs = new List<string>();
+            public readonly List<string> Shorts = new List<string>();
+            public double SpreadPct = double.NaN;
+            public readonly List<Leg> Legs = new List<Leg>();
+            public DateTime FilledEt = DateTime.MinValue;
+            public DateTime ExitEt = DateTime.MinValue;
+            public double Mae = double.NaN, Mfe = double.NaN;     // basket P&L low / high, dollars
+            public double Gross = double.NaN, Fees = double.NaN, Net = double.NaN;
+            public double BrokerFees = double.NaN, EstimatedFees = double.NaN;
+            public bool ExitPriceEstimated;
+
+            public void AddDetail(string text)
+            {
+                Detail = string.IsNullOrEmpty(Detail) ? text : Detail + " | " + text;
+            }
+        }
+
+        private enum BasketState { Idle, Entering, InBasket, Exiting }
+
+        // ------------------------------------------------------------------
+        // State
+        // ------------------------------------------------------------------
 
         private readonly object _sync = new object();
-
-        private string _runId;
-        private long _signalSequence;
-        private double _tickSize;
+        private readonly object _csvLock = new object();
+        private readonly List<Slot> _slots = new List<Slot>();
         private bool _stopping;
-        private bool _rebindInProgress;
+        private bool _ready;
+
+        private BasketState _state = BasketState.Idle;
+        private AttemptLog _current;
+        private DateTime _enterStartUtc, _exitStartUtc, _lastCloseRequestUtc = DateTime.MinValue, _flatSinceUtc;
+        private DateTime _lastMinuteEvaluatedEt = DateTime.MinValue;
+        private string _exitReason = "";
+        private bool _exitSlowLogged, _exitFailureLogged;
+
+        // Daily / cumulative (this run only; reset on every start)
+        private DateTime _dayEt = DateTime.MinValue;
+        private double _dailyPnl, _cumulativePnl;
+        private bool _dayKilled, _strategyKilled, _dayRowWritten, _flatByLogged;
+        private readonly bool[] _attemptHandled = new bool[3];
+        private readonly bool[] _rankingLogged = new bool[3];
+        private int _attemptsLogged, _basketsTraded;
+
+        private string _attemptsCsv, _daysCsv;
+        private System.Timers.Timer _timer;
+        private System.Timers.Timer _connectionWatchdog;
         private bool _lastKnownConnected = true;
+        private bool _rebindInProgress;
         private readonly Dictionary<Connection, EventHandler<ConnectionStateChangedEventArgs>>
             _connectionHandlers = new Dictionary<Connection, EventHandler<ConnectionStateChangedEventArgs>>();
-        private System.Timers.Timer _connectionWatchdog;
-        private System.Timers.Timer _housekeepingTimer;
-
-        // 1-min and 30-sec bars, each with its own ADX.
-        private HistoricalData _filterHistory;
-        private HistoricalData _signalHistory;
-        private Indicator _filterAdx;
-        private Indicator _signalAdx;
-        // Line indices inside the built-in ADX indicator; resolved by name at load.
-        private int _adxLine = 0, _plusDiLine = 1, _minusDiLine = 2;
-
-        // Trade log
-        private string _tradeCsv;
-        private TradeRecord _openRecord;
-        private readonly List<Execution> _executions = new List<Execution>();
-        private const int ExitFillTimeoutSeconds = 10;
-
-        // ADX / +DI / -DI on both charts at one moment (last closed bar of each).
-        private sealed class DmiSnapshot
-        {
-            public double Adx30 = double.NaN, Plus30 = double.NaN, Minus30 = double.NaN;
-            public double Adx1m = double.NaN, Plus1m = double.NaN, Minus1m = double.NaN;
-        }
-
-        private sealed class TradeRecord
-        {
-            public string SignalId;
-            public Side Side;
-            public string EntryOrderId;
-            public DateTime SubmitTime;
-            public DateTime EntryTime;
-            public DateTime ExitTime;
-            public double PositionOpenPrice = double.NaN; // fallback if no entry execution arrives
-            public double EntryQty, EntryNotional, ExitQty, ExitNotional;
-            public double Fees = double.NaN;
-            public double MfeTicks, MaeTicks;             // MFE >= 0, MAE <= 0, measured from the fill
-            public string ExitReason = "";
-            public DmiSnapshot AtEntry, AtExit;
-            public bool Closed;
-            public int Written;
-            public System.Timers.Timer Fallback;
-            public double EntryFill => EntryQty > 0 ? EntryNotional / EntryQty : PositionOpenPrice;
-            public double ExitFill => ExitQty > 0 ? ExitNotional / ExitQty : double.NaN;
-            public bool ExitComplete => ExitQty > 0 && ExitQty >= (EntryQty > 0 ? EntryQty : 1) - 1e-9;
-        }
-
-        // One execution on our account/symbol, consumed by at most one trade.
-        private sealed class Execution
-        {
-            public string OrderId;
-            public Side Side;
-            public double Price, Quantity, Fee;
-            public DateTime Seen;
-            public bool Claimed;
-        }
-
-        // Position state
-        private Position _paperPosition;
-        private bool _paperEntryPending;
-        private bool _exitRequested;
-        private string _exitReason = "";
-        private bool _paperTradingBlockedAfterReconnect;
-        private Side _paperPendingSide;
-        private string _paperSignalId = "";
-
-        // Pullback limit entry
-        private double _bid = double.NaN, _ask = double.NaN;
-        private string _entryOrderId;
-        private DateTime _entryDeadlineUtc = DateTime.MaxValue;
-        private bool _entryCancelRequested;
-        private DateTime _entryCancelUtc;
-        private DateTime _nextReconcileUtc = DateTime.MinValue;
 
         public strategyTesting()
         {
             Name = "strategyTesting";
-            Description = "ADX + candles: two 30-sec candles and the last 1-min candle in one direction, ADX above threshold on both charts, hard stop + take profit.";
+            Description = "Intraday basket: rank MES/MNQ/MGC/MCL/MHG over 15 minutes, long top 3 / short bottom 2, " +
+                          "time exit or -$250 cap, daily and cumulative kill switches, flat by 15:30 ET.";
         }
+
+        // ------------------------------------------------------------------
+        // Lifecycle
+        // ------------------------------------------------------------------
 
         protected override void OnRun()
         {
             _stopping = false;
-            _paperTradingBlockedAfterReconnect = false;
-            if (CurrentSymbol == null)
+            _ready = false;
+            _slots.Clear();
+
+            Symbol[] chosen = { MesSymbol, MnqSymbol, MgcSymbol, MclSymbol, MhgSymbol };
+            for (int i = 0; i < SymbolSpecs.Length; i++)
             {
-                Log("Symbol must be selected.", StrategyLoggingLevel.Error);
+                if (chosen[i] == null)
+                {
+                    Log($"{SymbolSpecs[i].Key} symbol must be selected.", StrategyLoggingLevel.Error);
+                    return;
+                }
+                Symbol symbol = Core.GetSymbol(chosen[i].CreateInfo());
+                if (symbol == null || symbol.TickSize <= 0)
+                {
+                    Log($"{SymbolSpecs[i].Key}: symbol could not be loaded or has an invalid tick size.", StrategyLoggingLevel.Error);
+                    return;
+                }
+                _slots.Add(new Slot
+                {
+                    Index = i,
+                    Key = SymbolSpecs[i].Key,
+                    DollarsPerPoint = SymbolSpecs[i].DollarsPerPoint,
+                    SpecTick = SymbolSpecs[i].SpecTick,
+                    FeePerSide = Math.Max(0, new[] { FeeMes, FeeMnq, FeeMgc, FeeMcl, FeeMhg }[i]),
+                    Symbol = symbol,
+                    TickSize = symbol.TickSize
+                });
+            }
+            if (CurrentAccount == null)
+            {
+                Log("Account must be selected.", StrategyLoggingLevel.Error);
                 return;
             }
-
-            CurrentSymbol = Core.GetSymbol(CurrentSymbol.CreateInfo());
-            _tickSize = CurrentSymbol.TickSize;
-            if (_tickSize <= 0)
+            if (_slots.Select(s => s.Symbol.Id).Distinct().Count() != _slots.Count)
             {
-                Log("The selected symbol has an invalid tick size.", StrategyLoggingLevel.Error);
+                Log("The same symbol is selected in more than one slot.", StrategyLoggingLevel.Error);
                 return;
             }
+            foreach (Slot s in _slots)
+            {
+                bool tickOk = Math.Abs(s.TickSize - s.SpecTick) < s.SpecTick * 1e-6;
+                string expiry = s.Symbol.ExpirationDate == default ? "n/a" : s.Symbol.ExpirationDate.ToString("yyyy-MM-dd");
+                Log($"{s.Key} = {s.Symbol.Name}, tick {s.TickSize}, ${s.DollarsPerPoint}/point " +
+                    $"(${s.DollarsPerPoint * s.TickSize:F2}/tick), expires {expiry}." +
+                    $" Fee ${s.FeePerSide:F2}/side." +
+                    (tickOk ? "" : $" WARNING: spec tick is {s.SpecTick}; check the symbol."),
+                    tickOk ? StrategyLoggingLevel.Info : StrategyLoggingLevel.Error);
+            }
 
-            FilterMinutes = Math.Max(1, FilterMinutes);
-            SignalSeconds = Math.Max(5, SignalSeconds);
-            AdxPeriod = Math.Max(2, AdxPeriod);
-            PaperQuantity = Math.Max(1, PaperQuantity);
-            StopTicks = Math.Max(1, StopTicks);
-            TargetTicks = Math.Max(1, TargetTicks);
-            PullbackTicks = Math.Max(0, PullbackTicks);
-            EntryTimeoutSeconds = Math.Max(1, EntryTimeoutSeconds);
+            string downloads = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+            _attemptsCsv = Path.Combine(downloads, "Basket_attempts.csv");
+            _daysCsv = Path.Combine(downloads, "Basket_days.csv");
+            try
+            {
+                EnsureHeader(_attemptsCsv, AttemptsHeader());
+                EnsureHeader(_daysCsv, DaysHeader);
+            }
+            catch (Exception ex) { Log("CSV setup failed: " + ex.Message, StrategyLoggingLevel.Error); }
 
-            _runId = Guid.NewGuid().ToString("N");
+            lock (_sync)
+            {
+                _state = BasketState.Idle;
+                _current = null;
+                ResetSessionState();
+                if (!LoadHistories()) return;
+            }
 
-            accountTakeProfit = inputedAccountTakeProfit * PaperQuantity;
-            accountStopLoss = inputedAccountStopLoss * PaperQuantity;
-            _accountLimitLogged = _accountStopLogged = _outsideHoursLogged = false;
-            _nextFlattenUtc = DateTime.MinValue;
-            // If no Starting Balance is entered, account P&L is measured from the balance at start.
-            _baselineBalance = CurrentAccount != null ? CurrentAccount.Balance : 0;
-
-            _tradeCsv = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                "Downloads", "AdexEntry_trades.csv");
-            try { EnsureHeader(_tradeCsv, CsvHeader); }
-            catch (Exception ex) { Log("Trade CSV setup failed: " + ex.Message, StrategyLoggingLevel.Error); }
-
-            if (!LoadHistory()) return;
-
-            CurrentSymbol.NewLast -= OnNewLast;
-            CurrentSymbol.NewLast += OnNewLast;
-            CurrentSymbol.NewQuote -= OnNewQuote;
-            CurrentSymbol.NewQuote += OnNewQuote;
+            DateTime nowEt = ToEastern(DateTime.UtcNow);
+            foreach (Slot s in _slots)
+            {
+                s.CountingSinceEt = TruncateMinute(nowEt).AddMinutes(1);
+                s.Symbol.NewLast -= OnNewLast;
+                s.Symbol.NewLast += OnNewLast;
+                s.Symbol.NewQuote -= OnNewQuote;
+                s.Symbol.NewQuote += OnNewQuote;
+            }
             Core.Instance.TradeAdded -= OnTradeAdded;
             Core.Instance.TradeAdded += OnTradeAdded;
-            Core.Instance.PositionAdded += OnPositionAdded;
-            Core.Instance.PositionRemoved += OnPositionRemoved;
 
             Core.Instance.Connections.ConnectionAdded += OnConnectionAdded;
             Core.Instance.Connections.ConnectionRemoved += OnConnectionRemoved;
             foreach (Connection connection in Core.Instance.Connections.All)
                 SubscribeToConnection(connection);
-            _lastKnownConnected = Core.Instance.Connections.All.Any(
-                c => c.State == ConnectionState.Connected);
+            _lastKnownConnected = Core.Instance.Connections.All.Any(c => c.State == ConnectionState.Connected);
             _connectionWatchdog = new System.Timers.Timer(15000) { AutoReset = true };
             _connectionWatchdog.Elapsed += (s, e) => CheckConnectionHealth();
             _connectionWatchdog.Start();
 
-            _housekeepingTimer = new System.Timers.Timer(500) { AutoReset = true };
-            _housekeepingTimer.Elapsed += (s, e) => OnHousekeepingTimer();
-            _housekeepingTimer.Start();
+            // Attempts run purely by entry time: any attempt whose entry is still ahead runs. One whose
+            // entry has already passed is skipped for this session (logged here, no CSV row).
+            lock (_sync)
+            {
+                DateTime startEt = ToEastern(DateTime.UtcNow);
+                RollDayIfNeeded(startEt);
+                for (int i = 0; i < Attempts.Length; i++)
+                {
+                    bool passed = startEt.TimeOfDay > Attempts[i].Entry + EntryLateLimit;
+                    _attemptHandled[i] = _rankingLogged[i] = passed;
+                    Log($"Attempt {Attempts[i].Number} (entry {Attempts[i].Entry:hh\\:mm}): " +
+                        (passed ? "entry time already passed; not run this session." : "scheduled."),
+                        StrategyLoggingLevel.Info);
+                }
+            }
 
-            Log($"ADX + candles started for {CurrentSymbol.Name}: ADX({AdxPeriod}) > {AdxThreshold} on {SignalSeconds}-sec and {FilterMinutes}-min, " +
-                $"two {SignalSeconds}-sec + one {FilterMinutes}-min same-direction candles, ADX on both. " +
-                $"Pullback limit {PullbackTicks}t, cancel after {EntryTimeoutSeconds}s. Bracket SL={StopTicks}t TP={TargetTicks}t.",
+            _ready = true;
+            _timer = new System.Timers.Timer(1000) { AutoReset = true };
+            _timer.Elapsed += (s, e) => OnTimer();
+            _timer.Start();
+
+            Log("Basket strategy started. Attempts (ET): " +
+                string.Join("; ", Attempts.Select(a => $"#{a.Number} rank {a.RankStart:hh\\:mm}-{a.Entry.Subtract(TimeSpan.FromMinutes(1)):hh\\:mm}, " +
+                                                       $"entry {a.Entry:hh\\:mm}, exit {a.Exit:hh\\:mm}")) +
+                $". Flat by {FlatBy:hh\\:mm}. Entry MARKET, " +
+                $"{QtyPerLeg} per leg, fill timeout {EntryFillTimeoutMinutes} min, pre-send check: bid/ask under {QuoteMaxAgeSeconds}s old and spread <= {MaxSpreadTicks} ticks. " +
+                $"Cap -${MaxLossPerBasket:F2} after {CapActiveAfterMinutes} min, day -${MaxLossPerDay:F2}, cumulative -${MaxCumulativeDrawdown:F2}. " +
+                $"P&L uses {(UseFeeEstimates ? "ESTIMATED fees (inputs)" : "BROKER-reported fees")}.",
                 StrategyLoggingLevel.Info);
-            Log($"Trades CSV: {_tradeCsv}", StrategyLoggingLevel.Info);
-            Log($"Account TP {accountTakeProfit:F2} (stops new entries), account SL {-Math.Abs(accountStopLoss):F2} " +
-                $"(closes everything), measured from balance {(StartingBalance > 0 ? StartingBalance : _baselineBalance):F2}. " +
-                $"New entries only inside the ET trading window(s) in IsTradingTimeValid.",
-                StrategyLoggingLevel.Info);
+            Log($"State: day {_dayEt:yyyy-MM-dd} P&L {_dailyPnl:F2}{(_dayKilled ? " (DAY_KILLED)" : "")}, " +
+                $"cumulative {_cumulativePnl:F2}{(_strategyKilled ? " (STRATEGY_KILLED)" : "")}. Logs: {_attemptsCsv}, {_daysCsv}.",
+                _strategyKilled ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info);
         }
 
         protected override void OnStop()
         {
             _stopping = true;
-            if (CurrentSymbol != null) CurrentSymbol.NewLast -= OnNewLast;
-            if (CurrentSymbol != null) CurrentSymbol.NewQuote -= OnNewQuote;
-            Core.Instance.TradeAdded -= OnTradeAdded;
-            Core.Instance.PositionAdded -= OnPositionAdded;
-            Core.Instance.PositionRemoved -= OnPositionRemoved;
+            _timer?.Stop();
+            _timer?.Dispose();
+            _timer = null;
+            _connectionWatchdog?.Stop();
+            _connectionWatchdog?.Dispose();
+            _connectionWatchdog = null;
 
+            // Flatten before detaching, so closing fills still reach OnTradeAdded.
+            if (_ready) FlattenOnStop();
+
+            foreach (Slot s in _slots)
+            {
+                if (s.Symbol == null) continue;
+                s.Symbol.NewLast -= OnNewLast;
+                s.Symbol.NewQuote -= OnNewQuote;
+            }
+            Core.Instance.TradeAdded -= OnTradeAdded;
             foreach (var item in _connectionHandlers.ToList())
                 item.Key.StateChanged -= item.Value;
             _connectionHandlers.Clear();
             Core.Instance.Connections.ConnectionAdded -= OnConnectionAdded;
             Core.Instance.Connections.ConnectionRemoved -= OnConnectionRemoved;
-            _connectionWatchdog?.Stop();
-            _connectionWatchdog?.Dispose();
-            _connectionWatchdog = null;
-            _housekeepingTimer?.Stop();
-            _housekeepingTimer?.Dispose();
 
-            lock (_sync) UnloadHistory();
-            Log("ADX + candles stopped. Existing paper positions and their stop/target orders are left in place.",
-                StrategyLoggingLevel.Info);
+            lock (_sync)
+            {
+                UnloadHistories();
+            }
+            Log("Basket strategy stopped.", StrategyLoggingLevel.Info);
+        }
+
+        // On stop: cancel working orders and close every position on the basket symbols in this
+        // account, wait up to StopFlattenWaitSeconds for the closes and their fills, then log the
+        // open attempt (exit reason STOPPED) and add its P&L to the daily / cumulative totals.
+        private const int StopFlattenWaitSeconds = 5;
+
+        private void FlattenOnStop()
+        {
+            DateTime nowUtc = DateTime.UtcNow;
+            lock (_sync)
+            {
+                // Stopping is a deliberate user action: allow symbols that hit the refusal limit one
+                // more try, but keep waiting on closes the broker already accepted.
+                ResetCloseTracking(keepAccepted: true);
+                if (_state == BasketState.Entering || _state == BasketState.InBasket)
+                {
+                    BeginExit("STOPPED", "strategy stopped", nowUtc, ToEastern(nowUtc));
+                }
+                else if (_state == BasketState.Exiting)
+                {
+                    _current.AddDetail("strategy stopped while exiting");
+                    CancelWorkingOrders("strategy stopped");
+                    CloseAllPositions(nowUtc, "strategy stopped");
+                }
+                else if (AnyPositionsOrWorkingOrders())
+                {
+                    Log("Strategy stopped: closing positions / cancelling orders on basket symbols.", StrategyLoggingLevel.Trading);
+                    CancelWorkingOrders("strategy stopped");
+                    CloseAllPositions(nowUtc, "strategy stopped");
+                }
+                else return;
+            }
+
+            DateTime deadline = DateTime.UtcNow.AddSeconds(StopFlattenWaitSeconds);
+            bool flat = false;
+            while (DateTime.UtcNow < deadline)
+            {
+                lock (_sync)
+                {
+                    flat = !AnyPositionsOrWorkingOrders();
+                    bool fillsIn = _current == null || _current.Legs.All(l => l.ExitQty >= l.EntryQty - 1e-9);
+                    if (flat && fillsIn) break;
+                    if (!flat && (DateTime.UtcNow - _lastCloseRequestUtc).TotalSeconds >= 2)
+                    {
+                        CancelWorkingOrders("strategy stopped retry");
+                        CloseAllPositions(DateTime.UtcNow, "strategy stopped retry");
+                    }
+                }
+                System.Threading.Thread.Sleep(250);
+            }
+
+            lock (_sync)
+            {
+                flat = !AnyPositionsOrWorkingOrders();
+                if (_current != null)
+                {
+                    if (!flat) _current.AddDetail("not confirmed flat when the strategy stopped");
+                    FinishBasket();
+                }
+                if (flat)
+                    Log("Strategy stopped: basket symbols are flat.", StrategyLoggingLevel.Trading);
+                else
+                    Log($"Strategy stopped: positions or orders on basket symbols still open after {StopFlattenWaitSeconds}s. " +
+                        "Check the platform and flatten manually.", StrategyLoggingLevel.Error);
+            }
         }
 
         protected override void OnRemove()
         {
-            CurrentSymbol = null;
+            MesSymbol = MnqSymbol = MgcSymbol = MclSymbol = MhgSymbol = null;
             CurrentAccount = null;
         }
+
 
         protected override void OnInitializeMetrics(Meter meter)
         {
@@ -283,536 +486,738 @@ namespace strategyTesting
         }
 
         // ------------------------------------------------------------------
-        // Bars + ADX
+        // Market data
         // ------------------------------------------------------------------
 
-        private bool LoadHistory()
+
+
+        private bool LoadHistories()
         {
             try
             {
-                UnloadHistory();
-                // Enough history to warm up the indicator even across a weekend.
-                _filterHistory = CurrentSymbol.GetHistory(new Period(BasePeriod.Minute, FilterMinutes),
-                    HistoryType.Last, DateTime.UtcNow.AddDays(-4));
-                _signalHistory = CurrentSymbol.GetHistory(new Period(BasePeriod.Second, SignalSeconds),
-                    HistoryType.Last, DateTime.UtcNow.AddDays(-1));
-
-                // SMMA = Wilder's smoothing, the standard ADX smoothing.
-                _filterAdx = Core.Indicators.BuiltIn.ADX(AdxPeriod, MaMode.SMMA);
-                _signalAdx = Core.Indicators.BuiltIn.ADX(AdxPeriod, MaMode.SMMA);
-                _filterHistory.AddIndicator(_filterAdx);
-                _signalHistory.AddIndicator(_signalAdx);
-                ResolveAdxLine(_filterAdx);
-                _signalHistory.NewHistoryItem += OnNewSignalBar;
-
-                if (double.IsNaN(Value(_filterAdx, 1, _adxLine)) || double.IsNaN(Value(_signalAdx, 1, _adxLine)))
-                {
-                    Log("ADX has no value yet on the last closed bars.", StrategyLoggingLevel.Error);
-                    return false;
-                }
-                Log($"Loaded {_filterHistory.Count} x {FilterMinutes}-min bars: ADX={Value(_filterAdx, 1, _adxLine):F2}. " +
-                    $"Loaded {_signalHistory.Count} x {SignalSeconds}-sec bars: ADX={Value(_signalAdx, 1, _adxLine):F2}. " +
-                    "Compare ADX with the chart before trusting signals.",
+                UnloadHistories();
+                foreach (Slot s in _slots)
+                    s.History = s.Symbol.GetHistory(Period.MIN1, HistoryType.Last, DateTime.UtcNow.AddDays(-1));
+                Log("Loaded 1-minute bars: " + string.Join(", ", _slots.Select(s => $"{s.Key} {s.History?.Count ?? 0}")) + ".",
                     StrategyLoggingLevel.Info);
                 return true;
             }
             catch (Exception ex)
             {
-                Log("History/indicator load failed: " + ex.Message, StrategyLoggingLevel.Error);
+                Log("History load failed: " + ex.Message, StrategyLoggingLevel.Error);
                 return false;
             }
         }
 
-        // Find the ADX, +DI and -DI lines by name so the code does not depend on line order.
-        private void ResolveAdxLine(Indicator indicator)
+        // Backup for a history that stopped updating: fetch this symbol's 1-minute bars again.
+        private bool ReloadHistory(Slot s)
         {
-            var lines = indicator.LinesSeries;
-            string names = string.Join(", ", lines.Select((l, i) => $"{i}='{l.Name}'"));
-            int adx = -1, plus = -1, minus = -1;
-            for (int i = 0; i < lines.Length; i++)
+            try
             {
-                string n = (lines[i].Name ?? "").Replace(" ", "").ToUpperInvariant();
-                if (n.Contains("+DI") || n.Contains("PLUS") || n == "DI+") plus = i;
-                else if (n.Contains("-DI") || n.Contains("MINUS") || n == "DI-") minus = i;
-                else if (n.Contains("ADX") && adx < 0) adx = i;
+                HistoricalData fresh = s.Symbol.GetHistory(Period.MIN1, HistoryType.Last, DateTime.UtcNow.AddDays(-1));
+                if (fresh == null) return false;
+                s.History?.Dispose();
+                s.History = fresh;
+                return true;
             }
-            _adxLine = adx >= 0 ? adx : 0;
-            _plusDiLine = plus >= 0 ? plus : 1;
-            _minusDiLine = minus >= 0 ? minus : 2;
-            bool matched = adx >= 0 && plus >= 0 && minus >= 0;
-            Log($"ADX lines: {names} -> ADX={_adxLine}, +DI={_plusDiLine}, -DI={_minusDiLine}" +
-                (matched ? "." : " (not all matched by name; using default order ADX=0, +DI=1, -DI=2 where missing). Verify against the chart."),
-                matched ? StrategyLoggingLevel.Info : StrategyLoggingLevel.Error);
-        }
-
-        // Offset of the last CLOSED bar as of asOfUtc. If the forming bar has already ended
-        // (the roll-over event hasn't arrived yet), the forming bar is the closed one.
-        private static int ClosedOffset(HistoricalData history, TimeSpan period, DateTime asOfUtc)
-        {
-            return history[0, SeekOriginHistory.End].TimeLeft.Add(period) <= asOfUtc ? 0 : 1;
-        }
-
-        private DmiSnapshot TakeSnapshot(DateTime asOfUtc)
-        {
-            var s = new DmiSnapshot();
-            if (_signalHistory != null && _signalAdx != null && _signalHistory.Count > 2)
+            catch (Exception ex)
             {
-                int o = ClosedOffset(_signalHistory, TimeSpan.FromSeconds(SignalSeconds), asOfUtc);
-                s.Adx30 = Value(_signalAdx, o, _adxLine);
-                s.Plus30 = Value(_signalAdx, o, _plusDiLine);
-                s.Minus30 = Value(_signalAdx, o, _minusDiLine);
-            }
-            if (_filterHistory != null && _filterAdx != null && _filterHistory.Count > 2)
-            {
-                int o = ClosedOffset(_filterHistory, TimeSpan.FromMinutes(FilterMinutes), asOfUtc);
-                s.Adx1m = Value(_filterAdx, o, _adxLine);
-                s.Plus1m = Value(_filterAdx, o, _plusDiLine);
-                s.Minus1m = Value(_filterAdx, o, _minusDiLine);
-            }
-            return s;
-        }
-
-        private void UnloadHistory()
-        {
-            if (_signalHistory != null)
-            {
-                _signalHistory.NewHistoryItem -= OnNewSignalBar;
-                if (_signalAdx != null) _signalHistory.RemoveIndicator(_signalAdx);
-                _signalHistory.Dispose();
-                _signalHistory = null;
-            }
-            if (_filterHistory != null)
-            {
-                if (_filterAdx != null) _filterHistory.RemoveIndicator(_filterAdx);
-                _filterHistory.Dispose();
-                _filterHistory = null;
-            }
-            _filterAdx = null;
-            _signalAdx = null;
-        }
-
-        // offset 0 = forming bar, 1 = last closed bar, 2 = the bar before that.
-        private static double Value(Indicator indicator, int offset, int line)
-        {
-            return indicator == null ? double.NaN : indicator.GetValue(offset, line);
-        }
-
-        // Fires when a new signal bar opens, so offset 1 is the bar that just closed
-        // and offset 2 is the one before it.
-        private void OnNewSignalBar(object sender, HistoryEventArgs e)
-        {
-            if (_stopping) return;
-            lock (_sync)
-            {
-                if (_signalHistory == null || _signalHistory.Count < AdxPeriod * 2 + 3) return;
-                if (_filterHistory == null || _filterHistory.Count < AdxPeriod * 2 + 2) return;
-                DateTime nowUtc = DateTime.UtcNow;
-
-                // Only look for entries while flat.
-                if (_paperPosition != null || _paperEntryPending) return;
-
-                // Entry window (ET). Exits and stops are never gated by this.
-                if (!IsTradingTimeValid(ToEastern(nowUtc).TimeOfDay))
-                {
-                    if (!_outsideHoursLogged)
-                        Log("Outside trading hours; no new entries until the next window.", StrategyLoggingLevel.Info);
-                    _outsideHoursLogged = true;
-                    return;
-                }
-                _outsideHoursLogged = false;
-
-                if (AccountLimitReason().Length > 0) return;
-
-                IHistoryItem bar1 = _signalHistory[1, SeekOriginHistory.End];
-                IHistoryItem bar2 = _signalHistory[2, SeekOriginHistory.End];
-                int dir1 = CandleDirection(bar1);
-                int dir2 = CandleDirection(bar2);
-                if (dir1 == 0 || dir1 != dir2) return;
-
-                // Last CLOSED 1-minute bar as of this 30-second close. On a minute boundary the
-                // 30-sec event can arrive before the 1-min bar rolls over, so if the forming 1-min
-                // bar has already ended by this close time, treat it as the closed one.
-                DateTime signalCloseUtc = bar1.TimeLeft.AddSeconds(SignalSeconds);
-                int filterOffset = ClosedOffset(_filterHistory, TimeSpan.FromMinutes(FilterMinutes), signalCloseUtc);
-                IHistoryItem filterBar = _filterHistory[filterOffset, SeekOriginHistory.End];
-                int filterDir = CandleDirection(filterBar);
-
-                Side side = dir1 > 0 ? Side.Buy : Side.Sell;
-                string label = side == Side.Buy ? "LONG" : "SHORT";
-                string word = side == Side.Buy ? "bullish" : "bearish";
-
-                string candles = $"{SignalSeconds}-sec {bar2.TimeLeft:HH:mm:ss} O{bar2[PriceType.Open]:F2}/C{bar2[PriceType.Close]:F2}, " +
-                    $"{bar1.TimeLeft:HH:mm:ss} O{bar1[PriceType.Open]:F2}/C{bar1[PriceType.Close]:F2}; " +
-                    $"{FilterMinutes}-min {filterBar.TimeLeft:HH:mm} O{filterBar[PriceType.Open]:F2}/C{filterBar[PriceType.Close]:F2}";
-
-                if (filterDir != dir1)
-                {
-                    Log($"{label} skipped: two {word} {SignalSeconds}-sec candles but the last {FilterMinutes}-min candle was not {word} ({candles}).",
-                        StrategyLoggingLevel.Info);
-                    return;
-                }
-
-                double signalAdx = Value(_signalAdx, 1, _adxLine);
-                double filterAdx = Value(_filterAdx, filterOffset, _adxLine);
-                string adxText = $"{SignalSeconds}-sec ADX={signalAdx:F2}, {FilterMinutes}-min ADX={filterAdx:F2}";
-                bool adxOk = !double.IsNaN(signalAdx) && !double.IsNaN(filterAdx)
-                    && signalAdx > AdxThreshold && filterAdx > AdxThreshold;
-                if (!adxOk)
-                {
-                    Log($"{label} skipped: candles all {word} but ADX not above {AdxThreshold} on both ({adxText}; {candles}).",
-                        StrategyLoggingLevel.Info);
-                    return;
-                }
-
-                Signal(side, $"all {word}: {candles}; {adxText}", signalCloseUtc);
+                Log($"{s.Key}: history reload failed: {ex.Message}", StrategyLoggingLevel.Error);
+                return false;
             }
         }
 
-        // +1 bullish (close > open), -1 bearish (close < open), 0 doji or no data.
-        private static int CandleDirection(IHistoryItem bar)
+        private void UnloadHistories()
         {
-            double open = bar[PriceType.Open], close = bar[PriceType.Close];
-            if (double.IsNaN(open) || double.IsNaN(close)) return 0;
-            return close > open ? 1 : close < open ? -1 : 0;
-        }
-
-        private void Signal(Side side, string detail, DateTime signalCloseUtc)
-        {
-            string signalId = _runId + "-S" + (++_signalSequence).ToString("D6");
-            Log($"{side} signal {signalId}: {detail}.", StrategyLoggingLevel.Trading);
-
-            if (!TryPlacePaperOrder(side, signalId, TakeSnapshot(signalCloseUtc)))
-                Log($"Signal {signalId} not traded (entry refused).", StrategyLoggingLevel.Info);
-        }
-
-        // ------------------------------------------------------------------
-        // Stop / target exit: close the position when a trade prints at or
-        // through fill -/+ StopTicks or fill +/- TargetTicks. Runs alongside
-        // the server-side bracket; whichever acts first closes the position.
-        // ------------------------------------------------------------------
-
-        private void OnNewLast(Symbol symbol, Last last)
-        {
-            if (_stopping || last == null || last.Price <= 0) return;
-            lock (_sync)
+            foreach (Slot s in _slots)
             {
-                if (_paperPosition != null) CheckAccountStop(DateTime.UtcNow);
-                if (_paperPosition == null) return;
-                double entry = _paperPosition.OpenPrice;
-                if (double.IsNaN(entry) || entry <= 0 || _tickSize <= 0) return;
-
-                bool isLong = _paperPosition.Side == Side.Buy;
-
-                // MFE / MAE in ticks from the fill, tracked until the position is gone.
-                if (_openRecord != null && !_openRecord.Closed)
-                {
-                    double moveTicks = (last.Price - entry) * (isLong ? 1.0 : -1.0) / _tickSize;
-                    if (moveTicks > _openRecord.MfeTicks) _openRecord.MfeTicks = moveTicks;
-                    if (moveTicks < _openRecord.MaeTicks) _openRecord.MaeTicks = moveTicks;
-                }
-
-                if (_exitRequested) return;
-                double stopPrice = isLong ? entry - StopTicks * _tickSize : entry + StopTicks * _tickSize;
-                double targetPrice = isLong ? entry + TargetTicks * _tickSize : entry - TargetTicks * _tickSize;
-                // Half-tick tolerance so floating-point noise doesn't miss an exact touch.
-                double eps = _tickSize * 0.5;
-                bool stopHit = isLong ? last.Price <= stopPrice + eps : last.Price >= stopPrice - eps;
-                bool targetHit = isLong ? last.Price >= targetPrice - eps : last.Price <= targetPrice + eps;
-                if (!stopHit && !targetHit) return;
-
-                string reason = stopHit ? "stop" : "target";
-                _exitRequested = true;
-                _exitReason = reason;
-                TradingOperationResult result = Core.Instance.ClosePosition(_paperPosition);
-                if (result.Status == TradingOperationResultStatus.Success)
-                {
-                    Log($"PAPER {reason} exit requested: trade {last.Price:F2}, fill {entry:F2}, " +
-                        $"stop {stopPrice:F2} ({StopTicks}t), target {targetPrice:F2} ({TargetTicks}t); signal={_paperSignalId}",
-                        StrategyLoggingLevel.Trading);
-                    CancelWorkingOrders(reason + " exit");
-                }
-                else
-                {
-                    _exitRequested = false;
-                    _exitReason = "";
-                    Log($"PAPER {reason} exit failed: {result.Message}", StrategyLoggingLevel.Error);
-                }
-            }
-        }
-
-        private void OnHousekeepingTimer()
-        {
-            if (_stopping) return;
-            DateTime nowUtc = DateTime.UtcNow;
-            lock (_sync)
-            {
-                if (_stopping) return;
-                CheckAccountStop(nowUtc);
-                CheckEntryTimeout(nowUtc);
-                ReconcileOrphanedPositions(nowUtc);
+                s.History?.Dispose();
+                s.History = null;
             }
         }
 
         private void OnNewQuote(Symbol symbol, Quote quote)
         {
-            if (quote == null || double.IsNaN(quote.Bid) || double.IsNaN(quote.Ask)
-                || quote.Bid <= 0 || quote.Ask <= 0) return;
-            _bid = quote.Bid;
-            _ask = quote.Ask;
+            if (_stopping || quote == null) return;
+            if (double.IsNaN(quote.Bid) || double.IsNaN(quote.Ask) || quote.Bid <= 0 || quote.Ask <= 0) return;
+            lock (_sync)
+            {
+                Slot slot = _slots.FirstOrDefault(s => SameSymbol(s.Symbol, symbol));
+                if (slot == null) return;
+                slot.QuoteBid = quote.Bid;
+                slot.QuoteAsk = quote.Ask;
+                slot.QuoteTimeUtc = DateTime.UtcNow;
+            }
         }
 
-        // Pullback limit not filled in time -> cancel it, then go back to looking for signals
-        // once the platform confirms the order is no longer working. Caller holds _sync.
-        private void CheckEntryTimeout(DateTime nowUtc)
+        // "" if this slot's bid/ask is fresh and the spread is normal, else the reason it isn't.
+        private string QuoteProblem(Slot s, DateTime nowUtc)
         {
-            if (!_paperEntryPending || string.IsNullOrEmpty(_entryOrderId)) return;
-            Order order = Core.Instance.Orders.FirstOrDefault(o => o.Id == _entryOrderId);
-            bool working = order != null
-                && (order.Status == OrderStatus.Opened || order.Status == OrderStatus.PartiallyFilled);
-
-            if (!_entryCancelRequested)
-            {
-                if (nowUtc < _entryDeadlineUtc) return;
-                _entryCancelRequested = true;
-                _entryCancelUtc = nowUtc;
-                if (working)
-                {
-                    TradingOperationResult result = Core.Instance.CancelOrder((IOrder)order);
-                    Log(result.Status == TradingOperationResultStatus.Success
-                            ? $"Pullback LIMIT not filled in {EntryTimeoutSeconds}s; cancel requested (signal={_paperSignalId})."
-                            : $"Pullback LIMIT cancel FAILED (signal={_paperSignalId}): {result.Message}",
-                        result.Status == TradingOperationResultStatus.Success
-                            ? StrategyLoggingLevel.Trading : StrategyLoggingLevel.Error);
-                }
-                return;
-            }
-
-            // Cancel requested: wait until the order is gone. A fill that raced the cancel
-            // arrives through OnPositionAdded and clears _paperEntryPending there.
-            if (working)
-            {
-                if ((nowUtc - _entryCancelUtc).TotalSeconds > 10)
-                {
-                    _entryCancelUtc = nowUtc;
-                    Log($"Pullback LIMIT {_entryOrderId} still working 10s after cancel; retrying cancel.",
-                        StrategyLoggingLevel.Error);
-                    Core.Instance.CancelOrder((IOrder)order);
-                }
-                return;
-            }
-            if (Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol))) return;
-
-            Log($"Pullback entry cancelled, no fill; signal={_paperSignalId}. Watching for the next signal.",
-                StrategyLoggingLevel.Trading);
-            ClearEntryOrder();
-            _paperEntryPending = false;
-            _paperSignalId = "";
-            _openRecord = null;
+            if (s.QuoteTimeUtc == DateTime.MinValue) return $"{s.Key} no bid/ask received";
+            double age = (nowUtc - s.QuoteTimeUtc).TotalSeconds;
+            if (age > QuoteMaxAgeSeconds) return $"{s.Key} bid/ask {age:F0}s old > {QuoteMaxAgeSeconds}s";
+            double spreadTicks = (s.QuoteAsk - s.QuoteBid) / s.TickSize;
+            if (spreadTicks < -1e-6) return $"{s.Key} crossed quote bid {s.QuoteBid} ask {s.QuoteAsk}";
+            if (spreadTicks > MaxSpreadTicks + 1e-6)
+                return $"{s.Key} spread {spreadTicks:F0} ticks > {MaxSpreadTicks} (bid {s.QuoteBid} ask {s.QuoteAsk})";
+            return "";
         }
 
-        private void ClearEntryOrder()
+        private void OnNewLast(Symbol symbol, Last last)
         {
-            _entryOrderId = null;
-            _entryDeadlineUtc = DateTime.MaxValue;
-            _entryCancelRequested = false;
+            if (_stopping || last == null) return;
+            lock (_sync)
+            {
+                Slot slot = _slots.FirstOrDefault(s => SameSymbol(s.Symbol, symbol));
+                if (slot == null) return;
+                DateTime t = last.Time == default ? DateTime.UtcNow : last.Time;
+                DateTime minute = TruncateMinute(ToEastern(t));
+                slot.TradesPerMinuteEt.TryGetValue(minute, out int n);
+                slot.TradesPerMinuteEt[minute] = n + 1;
+                if (slot.TradesPerMinuteEt.Count > 600)
+                {
+                    DateTime cutoff = minute.AddHours(-6);
+                    foreach (DateTime k in slot.TradesPerMinuteEt.Keys.Where(k => k < cutoff).ToList())
+                        slot.TradesPerMinuteEt.Remove(k);
+                }
+            }
+        }
+
+        // Window endpoints, both from bars inside [firstMinuteEt, lastMinuteEt]; nothing is carried
+        // in from before the window. First = close of the first-minute bar, or of the earliest bar in
+        // the window if that one is missing. Last = close of the last-minute bar only; if that bar is
+        // missing, Last is NaN and the symbol has no valid return (it is also the entry reference).
+        // Also returns the trade count over the window.
+        private (double First, DateTime FirstT, double Last, int Ticks, string TickSource) WindowStats(Slot slot, DateTime firstMinuteEt, DateTime lastMinuteEt)
+        {
+            double first = double.NaN, lastClose = double.NaN;
+            DateTime firstT = DateTime.MaxValue;
+            long barTicks = 0;
+            HistoricalData h = slot.History;
+            if (h != null)
+            {
+                for (int k = 0; k < h.Count; k++)
+                {
+                    if (!(h[k, SeekOriginHistory.Begin] is HistoryItemBar bar)) continue;
+                    DateTime tEt = TruncateMinute(ToEastern(bar.TimeLeft));
+                    if (tEt < firstMinuteEt || tEt > lastMinuteEt) continue;
+                    if (tEt < firstT) { first = bar.Close; firstT = tEt; }
+                    if (tEt == lastMinuteEt) lastClose = bar.Close;
+                    barTicks += (long)bar.Ticks;
+                }
+            }
+
+            // Prefer our own trade count when we were listening for the whole window.
+            if (slot.CountingSinceEt <= firstMinuteEt)
+            {
+                int counted = slot.TradesPerMinuteEt.Where(kv => kv.Key >= firstMinuteEt && kv.Key <= lastMinuteEt).Sum(kv => kv.Value);
+                return (first, firstT, lastClose, counted, "trades");
+            }
+            return (first, firstT, lastClose, (int)Math.Min(int.MaxValue, barTicks), "bars");
         }
 
         // ------------------------------------------------------------------
-        // Orders and positions
+        // Main loop (1 second)
         // ------------------------------------------------------------------
 
-        private bool TryPlacePaperOrder(Side side, string signalId, DmiSnapshot atEntry)
+        private void OnTimer()
         {
-            if (_paperTradingBlockedAfterReconnect)
+            if (_stopping || !_ready) return;
+            lock (_sync)
             {
-                Log("Signal not traded: paper execution is blocked after reconnect until strategy restart.",
-                    StrategyLoggingLevel.Error);
-                return false;
+                if (_stopping) return;
+                try { Step(DateTime.UtcNow); }
+                catch (Exception ex) { Log("Step error: " + ex, StrategyLoggingLevel.Error); }
             }
-            if (CurrentAccount == null)
+        }
+
+        private void Step(DateTime nowUtc)
+        {
+            DateTime nowEt = ToEastern(nowUtc);
+            RollDayIfNeeded(nowEt);
+
+            switch (_state)
             {
-                Log("Signal not traded: no account selected.", StrategyLoggingLevel.Error);
-                return false;
+                case BasketState.Entering: ManageEntering(nowUtc, nowEt); break;
+                case BasketState.InBasket: ManageInBasket(nowUtc, nowEt); break;
+                case BasketState.Exiting: ManageExiting(nowUtc, nowEt); break;
             }
-            if (_paperEntryPending || _paperPosition != null) return false;
-            if (Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol))) return false;
-            if (Core.Instance.Orders.Any(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
-                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled))) return false;
 
-            // Pullback limit, as in DirectEntry: buy below the bid, sell above the ask.
-            if (double.IsNaN(_bid) || double.IsNaN(_ask) || _bid <= 0 || _ask <= 0)
+            EnforceFlatBy(nowUtc, nowEt);
+            ScheduleAttempts(nowUtc, nowEt);
+            WriteDayRowIfDone(nowEt);
+        }
+
+        private void RollDayIfNeeded(DateTime nowEt)
+        {
+            DateTime today = nowEt.Date;
+            if (today == _dayEt) return;
+            if (_dayEt != DateTime.MinValue && IsTradingDay(_dayEt) && !_dayRowWritten)
+                WriteDayRow("strategy was not running at 15:30 this day");
+            _dayEt = today;
+            _dailyPnl = 0;
+            _dayKilled = false;
+            _dayRowWritten = false;
+            _flatByLogged = false;
+            _attemptsLogged = 0;
+            _basketsTraded = 0;
+            for (int i = 0; i < _attemptHandled.Length; i++) { _attemptHandled[i] = false; _rankingLogged[i] = false; }
+            if (IsTradingDay(today))
+                Log($"New trading day {today:yyyy-MM-dd}. Cumulative P&L {_cumulativePnl:F2}" +
+                    (_strategyKilled ? " - STRATEGY_KILLED, no attempts until reset." : "."), StrategyLoggingLevel.Info);
+        }
+
+        private void ScheduleAttempts(DateTime nowUtc, DateTime nowEt)
+        {
+            if (!IsTradingDay(_dayEt)) return;
+            TimeSpan tod = nowEt.TimeOfDay;
+            for (int i = 0; i < Attempts.Length; i++)
             {
-                Log("Signal not traded: no bid/ask quote yet to price the pullback limit.", StrategyLoggingLevel.Error);
-                return false;
+                if (_attemptHandled[i]) continue;
+                AttemptSpec a = Attempts[i];
+                if (tod < a.RankStart) continue;
+                if (!_rankingLogged[i] && tod < a.Entry)
+                {
+                    _rankingLogged[i] = true;
+                    Log($"Attempt {a.Number}: IDLE -> RANKING, window {a.RankStart:hh\\:mm}-{a.Entry.Subtract(TimeSpan.FromMinutes(1)):hh\\:mm}.",
+                        StrategyLoggingLevel.Info);
+                }
+                if (tod < a.Entry + EntryGrace) continue;
+
+                _attemptHandled[i] = true;
+                var log = new AttemptLog { DateEt = _dayEt, Spec = a };
+                if (tod > a.Entry + EntryLateLimit)
+                    FinishAttempt(log, "SKIPPED", "strategy was not running at entry time");
+                else if (_strategyKilled)
+                    FinishAttempt(log, "STRATEGY_KILLED", $"cumulative P&L {_cumulativePnl:F2}");
+                else if (_dayKilled)
+                    FinishAttempt(log, "DAY_KILLED", $"daily P&L {_dailyPnl:F2}");
+                else if (_state != BasketState.Idle)
+                    FinishAttempt(log, "SKIPPED", $"previous basket still {_state}");
+                else
+                    RunAttempt(log, nowUtc);
             }
-            double limitPrice = CurrentSymbol.RoundPriceToTickSize(side == Side.Buy
-                ? _bid - PullbackTicks * _tickSize
-                : _ask + PullbackTicks * _tickSize);
+        }
 
-            _paperEntryPending = true;
-            _paperPendingSide = side;
-            _paperSignalId = signalId;
-            _openRecord = new TradeRecord
-            {
-                SignalId = signalId,
-                Side = side,
-                SubmitTime = DateTime.Now,
-                AtEntry = atEntry
-            };
+        // ------------------------------------------------------------------
+        // Ranking and entry
+        // ------------------------------------------------------------------
 
-            var result = Core.Instance.PlaceOrder(new PlaceOrderRequestParameters
+        private void RunAttempt(AttemptLog log, DateTime nowUtc)
+        {
+            AttemptSpec a = log.Spec;
+            DateTime firstMinuteEt = _dayEt + a.RankStart;
+            DateTime lastMinuteEt = _dayEt + a.Entry - TimeSpan.FromMinutes(1);
+
+            var returns = new Dictionary<Slot, double>();
+            var missing = new List<string>();
+            foreach (Slot s in _slots)
             {
-                Symbol = CurrentSymbol,
+                var st = WindowStats(s, firstMinuteEt, lastMinuteEt);
+                if (double.IsNaN(st.Last))
+                {
+                    // Last-minute bar missing: reload once in case the history stopped updating.
+                    bool reloaded = ReloadHistory(s);
+                    if (reloaded) st = WindowStats(s, firstMinuteEt, lastMinuteEt);
+                    string result = !reloaded ? "reload failed"
+                        : double.IsNaN(st.Last) ? $"still no {lastMinuteEt:HH:mm} bar" : $"{lastMinuteEt:HH:mm} bar found";
+                    log.AddDetail($"{s.Key} bars reloaded ({result})");
+                    Log($"Attempt {a.Number}: {s.Key} had no {lastMinuteEt:HH:mm} bar; reloaded history - {result}.",
+                        double.IsNaN(st.Last) ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info);
+                }
+                double ret = st.First > 0 && st.Last > 0 ? (st.Last / st.First - 1) * 100 : double.NaN;
+                returns[s] = ret;
+                log.ReturnPct[s.Key] = ret;
+                log.EntryRef[s.Key] = st.Last;
+                if (s.Key == "MHG") { log.MhgTicks = st.Ticks; log.MhgTickSource = st.TickSource; }
+                if (double.IsNaN(st.Last))
+                    missing.Add($"{s.Key} (no {lastMinuteEt:HH:mm} bar)");
+                else if (double.IsNaN(st.First))
+                    missing.Add($"{s.Key} (no bar in window)");
+                else if (st.FirstT != firstMinuteEt)
+                    log.AddDetail($"{s.Key} no {firstMinuteEt:HH:mm} bar; first price from {st.FirstT:HH:mm}");
+            }
+
+            List<Slot> candidates = _slots.ToList();
+            Slot mhg = _slots.First(s => s.Key == "MHG");
+            string mhgDrop = log.MhgTicks < MhgMinTicksInWindow
+                ? $"{log.MhgTicks} ticks ({log.MhgTickSource}) < {MhgMinTicksInWindow}"
+                : double.IsNaN(returns[mhg]) ? $"no valid return (missing {lastMinuteEt:HH:mm} bar)" : null;
+            if (mhgDrop != null)
+            {
+                candidates.Remove(mhg);
+                missing.RemoveAll(m => m.StartsWith("MHG", StringComparison.Ordinal));
+                log.MhgRemoved = true;
+                log.AddDetail("THIN_SYMBOL_SKIP: MHG " + mhgDrop);
+                Log($"Attempt {a.Number}: THIN_SYMBOL_SKIP - MHG {mhgDrop}; basket is long 2 / short 2.",
+                    StrategyLoggingLevel.Info);
+            }
+            string returnsText = string.Join(", ", _slots.Select(s => $"{s.Key} {Fmt(returns[s], "F3")}%"));
+
+            if (missing.Count > 0)
+            {
+                FinishAttempt(log, "NO_DATA", "no valid return for " + string.Join("; ", missing) + "; returns " + returnsText);
+                return;
+            }
+
+            List<Slot> ranked = candidates.OrderByDescending(s => returns[s]).ThenBy(s => s.Index).ToList();
+            log.SpreadPct = returns[ranked.First()] - returns[ranked.Last()];
+            int nLong = ranked.Count - 2;
+            List<Slot> longs = ranked.Take(nLong).ToList();
+            List<Slot> shorts = ranked.Skip(nLong).ToList();
+            log.Longs.AddRange(longs.Select(s => s.Key));
+            log.Shorts.AddRange(shorts.Select(s => s.Key));
+
+            if (log.SpreadPct < NoSignalMinSpreadPct)
+            {
+                FinishAttempt(log, "NO_SIGNAL", $"spread {log.SpreadPct:F3}% < {NoSignalMinSpreadPct:F2}%; returns {returnsText}");
+                return;
+            }
+
+            Log($"Attempt {a.Number}: ranked {returnsText}; spread {log.SpreadPct:F3}%. " +
+                $"LONG {string.Join(",", log.Longs)} / SHORT {string.Join(",", log.Shorts)}.", StrategyLoggingLevel.Trading);
+
+            // Pre-entry checks, before any order is sent. A failure here still uses the attempt.
+            string block = "";
+            if (CurrentAccount == null) block = "no account";
+            else if (!Core.Instance.Connections.All.Any(c => c.State == ConnectionState.Connected)) block = "not connected";
+            else if (AnyPositionsOrWorkingOrders()) block = "a position or working order already exists on a basket symbol";
+            else
+            {
+                var problems = longs.Concat(shorts).Select(s => QuoteProblem(s, nowUtc)).Where(x => x.Length > 0).ToList();
+                if (problems.Count > 0) block = "quote check failed: " + string.Join("; ", problems);
+            }
+            if (block.Length > 0)
+            {
+                FinishAttempt(log, "NO_BASKET", "not entered: " + block);
+                return;
+            }
+
+            _current = log;
+            _state = BasketState.Entering;
+            _enterStartUtc = nowUtc;
+            foreach (Slot s in longs.Concat(shorts))
+            {
+                bool isLong = longs.Contains(s);
+                log.Legs.Add(new Leg
+                {
+                    Slot = s,
+                    Side = isLong ? Side.Buy : Side.Sell,
+                    Dir = isLong ? 1 : -1,
+                    EntryRef = log.EntryRef[s.Key],
+                    UseEstimatedFees = UseFeeEstimates
+                });
+            }
+
+            foreach (Leg leg in log.Legs)
+                PlaceEntry(leg, a.Number);
+
+            Log($"Attempt {a.Number}: RANKING -> entering basket; " +
+                string.Join(", ", log.Legs.Select(l => $"{l.Side} {l.Slot.Key} ref {l.EntryRef} " +
+                    $"{(l.Side == Side.Buy ? "ask" : "bid")} {Fmt(l.TouchAtSend, "G10")}" +
+                    (l.OrderFailed ? $" FAILED ({l.FailNote})" : ""))) + ".", StrategyLoggingLevel.Trading);
+        }
+
+        private void PlaceEntry(Leg leg, int attemptNumber)
+        {
+            Symbol sym = leg.Slot.Symbol;
+            var p = new PlaceOrderRequestParameters
+            {
+                Symbol = sym,
                 Account = CurrentAccount,
-                Side = side,
-                OrderTypeId = OrderType.Limit,
-                Price = limitPrice,
-                Quantity = PaperQuantity,
-                TimeInForce = TimeInForce.GTC,
-                Comment = "ADX_PULLBACK",
-                //TakeProfit = SlTpHolder.CreateTP(TargetTicks, PriceMeasurement.Offset),
-                //StopLoss = SlTpHolder.CreateSL(StopTicks, PriceMeasurement.Offset)
-            });
+                Side = leg.Side,
+                Quantity = QtyPerLeg,
+                TimeInForce = TimeInForce.Day,
+                Comment = $"BASKET_A{attemptNumber}_{leg.Slot.Key}"
+            };
+            // Market order. Record the ask (buy) / bid (sell) it was sent against, for the log only;
+            // the pre-send check has already confirmed this quote is fresh.
+            leg.TouchAtSend = leg.Side == Side.Buy ? leg.Slot.QuoteAsk : leg.Slot.QuoteBid;
+            leg.TouchSource = leg.Side == Side.Buy ? "ask" : "bid";
+            p.OrderTypeId = OrderType.Market;
+
+            TradingOperationResult result = Core.Instance.PlaceOrder(p);
             if (result.Status != TradingOperationResultStatus.Success)
             {
-                _paperEntryPending = false;
-                _paperSignalId = "";
-                _openRecord = null;
-                Log("Paper entry failed: " + result.Message, StrategyLoggingLevel.Error);
-                return false;
-            }
-            _openRecord.EntryOrderId = result.OrderId;
-            _entryOrderId = result.OrderId;
-            _entryCancelRequested = false;
-            _entryDeadlineUtc = DateTime.UtcNow.AddSeconds(EntryTimeoutSeconds);
-            // One-shot timer so the cancel lands at the timeout, not up to 0.5s later on housekeeping.
-            var cancelTimer = new System.Timers.Timer(EntryTimeoutSeconds * 1000) { AutoReset = false };
-            cancelTimer.Elapsed += (s, e) =>
-            {
-                cancelTimer.Dispose();
-                if (_stopping) return;
-                lock (_sync) CheckEntryTimeout(DateTime.UtcNow);
-            };
-            cancelTimer.Start();
-            Log($"PAPER pullback LIMIT submitted: {side} {PaperQuantity} @ {limitPrice:F2} " +
-                $"({PullbackTicks}t from bid {_bid:F2} / ask {_ask:F2}), cancel in {EntryTimeoutSeconds}s, " +
-                $"bracket SL={StopTicks}t TP={TargetTicks}t, signal={signalId}",
-                StrategyLoggingLevel.Trading);
-            return true;
-        }
-
-        private void OnPositionAdded(Position position)
-        {
-            lock (_sync)
-            {
-                if (!IsOurAccount(position.Account) || !IsOurSymbol(position.Symbol)) return;
-
-                if (_paperEntryPending && position.Side == _paperPendingSide)
-                {
-                    _paperPosition = position;
-                    _paperEntryPending = false;
-                    ClearEntryOrder();
-                    _exitRequested = false;
-                    _exitReason = "";
-                    if (_openRecord != null)
-                    {
-                        _openRecord.EntryTime = DateTime.Now;
-                        _openRecord.PositionOpenPrice = position.OpenPrice;
-                    }
-                    Log($"PAPER position filled: {position.Side} {position.Quantity} @ {position.OpenPrice:F2}; " +
-                        $"SL id={position.StopLoss?.Id ?? "none"}, TP id={position.TakeProfit?.Id ?? "none"}; signal={_paperSignalId}",
-                        StrategyLoggingLevel.Trading);
-                    if (position.StopLoss == null || position.TakeProfit == null)
-                        Log("WARNING: the position does not report both a stop and a target order. Check the platform.",
-                            StrategyLoggingLevel.Error);
-                    return;
-                }
-
-                string reason = _paperEntryPending
-                    ? $"a pending {_paperPendingSide} entry did not match the arriving {position.Side} position"
-                    : "no entry was pending when this position appeared";
-                CloseUnexpectedPosition(position, reason);
-            }
-        }
-
-        private void OnPositionRemoved(Position position)
-        {
-            lock (_sync)
-            {
-                if (_paperPosition == null || position.Id != _paperPosition.Id) return;
-                Log($"PAPER position closed: {position.Id}; signal={_paperSignalId}" +
-                    (_exitRequested ? $" ({_exitReason} exit)" : " (server bracket or closed elsewhere)"),
-                    StrategyLoggingLevel.Trading);
-                if (_openRecord != null)
-                {
-                    TradeRecord record = _openRecord;
-                    _openRecord = null;
-                    record.Closed = true;
-                    record.ExitTime = DateTime.Now;
-                    record.AtExit = TakeSnapshot(DateTime.UtcNow);
-                    record.ExitReason = _exitRequested ? _exitReason : "";
-                    RegisterClosedTrade(record);
-                }
-                _paperPosition = null;
-                _paperSignalId = "";
-                _exitRequested = false;
-                _exitReason = "";
-                // Remove any leftover bracket leg so it cannot open a new position.
-                CancelWorkingOrders("position closed");
-            }
-        }
-
-        // A position here did not come from this strategy's own entry flow, so it
-        // is not ours to manage. Close it rather than adopt it.
-        private void CloseUnexpectedPosition(Position position, string reason)
-        {
-            if (_paperPosition != null)
-            {
-                if (_paperPosition.Id == position.Id) return;
-                Log($"PAPER position anomaly: already tracking id={_paperPosition.Id} but an unrelated " +
-                    $"position id={position.Id}, side={position.Side}, qty={position.Quantity} appeared for " +
-                    $"our account/symbol ({reason}). Not touching it; check the platform.", StrategyLoggingLevel.Error);
+                leg.OrderFailed = true;
+                leg.FailNote = result.Message ?? "order refused";
                 return;
             }
-            Log($"PAPER position found outside the normal entry flow: id={position.Id}, side={position.Side}, " +
-                $"qty={position.Quantity} @ {position.OpenPrice:F2} ({reason}). Closing it rather than adopting it.",
-                StrategyLoggingLevel.Error);
-            TradingOperationResult result = Core.Instance.ClosePosition(position);
-            if (result.Status == TradingOperationResultStatus.Success)
+            leg.EntryOrderId = result.OrderId;
+        }
+
+        private void ManageEntering(DateTime nowUtc, DateTime nowEt)
+        {
+            AttemptLog log = _current;
+            foreach (Leg leg in log.Legs)
             {
-                Log($"Unexpected PAPER position close requested: id={position.Id}.", StrategyLoggingLevel.Trading);
-                if (!_paperEntryPending) CancelWorkingOrders("unexpected position closed");
+                if (leg.OrderFailed)
+                {
+                    BeginExit("NO_BASKET", $"{leg.Slot.Key} entry order failed: {leg.FailNote}", nowUtc, nowEt);
+                    return;
+                }
+                if (leg.EntryQty <= 0 && !string.IsNullOrEmpty(leg.EntryOrderId))
+                {
+                    Order order = Core.Instance.Orders.FirstOrDefault(o => o.Id == leg.EntryOrderId);
+                    if (order != null && (order.Status == OrderStatus.Refused || order.Status == OrderStatus.Cancelled))
+                    {
+                        BeginExit("NO_BASKET", $"{leg.Slot.Key} entry order {order.Status}", nowUtc, nowEt);
+                        return;
+                    }
+                }
             }
+
+            if (log.Legs.All(l => l.EntryQty >= QtyPerLeg - 1e-9))
+            {
+                _state = BasketState.InBasket;
+                log.FilledEt = nowEt;
+                _lastMinuteEvaluatedEt = TruncateMinute(nowEt);
+                Log($"Attempt {log.Spec.Number}: IN_BASKET; fills " +
+                    string.Join(", ", log.Legs.Select(l => $"{l.Side} {l.Slot.Key} {l.EntryFill} (ref {l.EntryRef} {l.SlippageTicks:F1}t, {l.TouchSource} {Fmt(l.TouchAtSend, "G10")} {Fmt(l.TouchSlippageTicks, "F1")}t)")) + ".",
+                    StrategyLoggingLevel.Trading);
+                return;
+            }
+
+            if (nowUtc >= _enterStartUtc.AddMinutes(EntryFillTimeoutMinutes))
+            {
+                string unfilled = string.Join(",", log.Legs.Where(l => l.EntryQty < QtyPerLeg - 1e-9).Select(l => l.Slot.Key));
+                BeginExit("NO_BASKET", $"unfilled after {EntryFillTimeoutMinutes} min: {unfilled}", nowUtc, nowEt);
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // In basket and exit
+        // ------------------------------------------------------------------
+
+        private void ManageInBasket(DateTime nowUtc, DateTime nowEt)
+        {
+            AttemptLog log = _current;
+            double pnl = BasketPnl(log);
+            if (!double.IsNaN(pnl))
+            {
+                if (double.IsNaN(log.Mae) || pnl < log.Mae) log.Mae = pnl;
+                if (double.IsNaN(log.Mfe) || pnl > log.Mfe) log.Mfe = pnl;
+            }
+
+            // A leg closed outside the strategy leaves a partial basket: exit the rest.
+            foreach (Leg leg in log.Legs)
+            {
+                if (HasPosition(leg.Slot)) { leg.MissingSinceUtc = DateTime.MinValue; continue; }
+                if (leg.MissingSinceUtc == DateTime.MinValue) { leg.MissingSinceUtc = nowUtc; continue; }
+                if ((nowUtc - leg.MissingSinceUtc).TotalSeconds >= 5)
+                {
+                    BeginExit("EXIT_FAILURE", $"{leg.Slot.Key} position closed outside the strategy", nowUtc, nowEt);
+                    return;
+                }
+            }
+
+            DateTime minute = TruncateMinute(nowEt);
+            if (minute == _lastMinuteEvaluatedEt) return;
+            _lastMinuteEvaluatedEt = minute;
+
+            // Evaluated at each 1-minute close.
+            if (nowEt.TimeOfDay >= log.Spec.Exit)
+            {
+                BeginExit("TIME_EXIT", $"exit time {log.Spec.Exit:hh\\:mm}, basket P&L {Fmt(pnl)}", nowUtc, nowEt);
+                return;
+            }
+            DateTime capActiveEt = log.DateEt + log.Spec.Entry + TimeSpan.FromMinutes(CapActiveAfterMinutes);
+            if (nowEt >= capActiveEt && !double.IsNaN(pnl) && pnl <= -MaxLossPerBasket)
+            {
+                BeginExit("CAP_EXIT", $"basket P&L {pnl:F2} <= -{MaxLossPerBasket:F2}", nowUtc, nowEt);
+                return;
+            }
+            Log($"Attempt {log.Spec.Number} {minute:HH:mm}: basket P&L {Fmt(pnl)} (MAE {Fmt(log.Mae)}, MFE {Fmt(log.Mfe)}).",
+                StrategyLoggingLevel.Info);
+        }
+
+        // Net of fees paid so far, at the last trade price of each leg.
+        private static double BasketPnl(AttemptLog log)
+        {
+            double total = 0;
+            foreach (Leg leg in log.Legs)
+            {
+                if (leg.EntryQty <= 0) continue;
+                double last = leg.Slot.Symbol?.Last ?? double.NaN;
+                if (double.IsNaN(last) || last <= 0) return double.NaN;
+                total += leg.Dir * (last - leg.EntryFill) * leg.Slot.DollarsPerPoint * leg.EntryQty - leg.Fees;
+            }
+            return total;
+        }
+
+        private void BeginExit(string reason, string detail, DateTime nowUtc, DateTime nowEt)
+        {
+            AttemptLog log = _current;
+            _exitReason = reason;
+            _state = BasketState.Exiting;
+            _exitStartUtc = nowUtc;
+            _flatSinceUtc = DateTime.MinValue;
+            _exitSlowLogged = false;
+            _exitFailureLogged = reason == "EXIT_FAILURE";
+            log.ExitEt = nowEt;
+            log.AddDetail(detail);
+            foreach (Leg leg in log.Legs)
+                leg.ExitPriceFallback = leg.Slot.Symbol?.Last ?? double.NaN;
+
+            Log($"Attempt {log.Spec.Number}: {reason} - {detail}. Exiting all legs at market.", StrategyLoggingLevel.Trading);
+            ResetCloseTracking(keepAccepted: false);
+            CancelWorkingOrders(reason);
+            CloseAllPositions(nowUtc, reason);
+        }
+
+        private void ManageExiting(DateTime nowUtc, DateTime nowEt)
+        {
+            AttemptLog log = _current;
+            if (AnyPositionsOrWorkingOrders())
+            {
+                _flatSinceUtc = DateTime.MinValue;
+                if ((nowUtc - _lastCloseRequestUtc).TotalSeconds >= 5)
+                {
+                    CancelWorkingOrders(_exitReason + " retry");
+                    CloseAllPositions(nowUtc, _exitReason + " retry");
+                }
+                if (!_exitSlowLogged && (nowUtc - _exitStartUtc).TotalSeconds >= 60)
+                {
+                    _exitSlowLogged = true;
+                    Log($"Attempt {log.Spec.Number}: still not flat 60s after {_exitReason}. Accepted closes are re-sent only after " +
+                        $"{CloseAcceptedWaitSeconds}s with no fill; refused ones up to {CloseMaxRefusals} times. Check the platform.",
+                        StrategyLoggingLevel.Error);
+                }
+                return;
+            }
+            if (_flatSinceUtc == DateTime.MinValue) _flatSinceUtc = nowUtc;
+
+            // Give racing entry fills a moment to appear, then wait for the closing executions.
+            bool fillsIn = log.Legs.All(l => l.ExitQty >= l.EntryQty - 1e-9);
+            if ((fillsIn && (nowUtc - _exitStartUtc).TotalSeconds >= 3) || (nowUtc - _flatSinceUtc).TotalSeconds >= 10)
+                FinishBasket();
+        }
+
+        private void FinishBasket()
+        {
+            AttemptLog log = _current;
+            double gross = 0, fees = 0;
+            bool anyFilled = false, priceMissing = false;
+            double brokerFees = 0, estimatedFees = 0;
+            foreach (Leg leg in log.Legs)
+            {
+                // Exit execution not seen: still charge the estimated exit side.
+                if (leg.ExitQty < leg.EntryQty - 1e-9)
+                    leg.EstimatedFees += (leg.EntryQty - leg.ExitQty) * leg.Slot.FeePerSide;
+                fees += leg.Fees;
+                brokerFees += leg.BrokerFees;
+                estimatedFees += leg.EstimatedFees;
+                if (leg.EntryQty <= 0) continue;
+                anyFilled = true;
+                if (leg.ExitQty < leg.EntryQty - 1e-9) log.ExitPriceEstimated = true;
+                double exit = leg.ExitFill;
+                if (double.IsNaN(exit)) { priceMissing = true; continue; }
+                gross += leg.Dir * (exit - leg.EntryFill) * leg.Slot.DollarsPerPoint * leg.EntryQty;
+            }
+            if (log.ExitPriceEstimated)
+                log.AddDetail("exit execution not seen for every leg; last price at exit used where missing");
+
+            log.BrokerFees = brokerFees;
+            log.EstimatedFees = estimatedFees;
+            if (!anyFilled) { log.Gross = 0; log.Fees = fees; log.Net = -fees; }
+            else if (priceMissing) { log.Gross = double.NaN; log.Fees = fees; log.Net = double.NaN; }
+            else { log.Gross = gross; log.Fees = fees; log.Net = gross - fees; }
+
+            _state = BasketState.Idle;
+            _current = null;
+            if (_exitReason == "TIME_EXIT" || _exitReason == "CAP_EXIT") _basketsTraded++;
+
+            if (double.IsNaN(log.Net))
+                Log($"Attempt {log.Spec.Number}: net P&L unknown (missing exit price); daily and cumulative P&L NOT updated. " +
+                    "Check the account.", StrategyLoggingLevel.Error);
             else
-                Log($"Unexpected PAPER position close FAILED: id={position.Id}: {result.Message}. " +
-                    "Manual intervention required.", StrategyLoggingLevel.Error);
+            {
+                _dailyPnl += log.Net;
+                _cumulativePnl += log.Net;
+            }
+            FinishAttempt(log, _exitReason, null);
+            Log($"Attempt {log.Spec.Number}: closed {_exitReason}, gross {Fmt(log.Gross)}, fees {Fmt(log.Fees)}, net {Fmt(log.Net)}. " +
+                $"Day {_dailyPnl:F2}, cumulative {_cumulativePnl:F2}. -> IDLE", StrategyLoggingLevel.Trading);
+
+            if (!_dayKilled && _dailyPnl <= -MaxLossPerDay)
+            {
+                _dayKilled = true;
+                Log($"DAY_KILLED: daily P&L {_dailyPnl:F2} <= -{MaxLossPerDay:F2}. No further attempts today.", StrategyLoggingLevel.Trading);
+            }
+            if (!_strategyKilled && _cumulativePnl <= -MaxCumulativeDrawdown)
+            {
+                _strategyKilled = true;
+                Log($"STRATEGY_KILLED: cumulative P&L {_cumulativePnl:F2} <= -{MaxCumulativeDrawdown:F2}. " +
+                    "No further attempts until the strategy is restarted.", StrategyLoggingLevel.Trading);
+            }
+        }
+
+        // Never carry a position past 15:30.
+        private void EnforceFlatBy(DateTime nowUtc, DateTime nowEt)
+        {
+            if (nowEt.TimeOfDay < FlatBy) return;
+            if (_state == BasketState.InBasket || _state == BasketState.Entering)
+            {
+                BeginExit("EXIT_FAILURE", $"basket still {_state} at {FlatBy:hh\\:mm}", nowUtc, nowEt);
+                return;
+            }
+            if (_state == BasketState.Exiting)
+            {
+                // Attempt 3's time exit fires at 15:30 itself, so give any exit 30s to complete
+                // before calling it a failure. ManageExiting keeps retrying the close meanwhile.
+                if (!_exitFailureLogged && (nowUtc - _exitStartUtc).TotalSeconds >= 30 && AnyPositionsOrWorkingOrders())
+                {
+                    _exitFailureLogged = true;
+                    _current.AddDetail($"EXIT_FAILURE: legs still open after {FlatBy:hh\\:mm} (30s after {_exitReason})");
+                    Log($"EXIT_FAILURE: legs still open after {FlatBy:hh\\:mm}, 30s after {_exitReason}; still flattening at market.",
+                        StrategyLoggingLevel.Error);
+                }
+                return;
+            }
+            if (!AnyPositionsOrWorkingOrders()) return;
+            if (!_flatByLogged)
+            {
+                _flatByLogged = true;
+                Log($"EXIT_FAILURE: position or working order on a basket symbol at {FlatBy:hh\\:mm} with no basket open; flattening at market.",
+                    StrategyLoggingLevel.Error);
+            }
+            if ((nowUtc - _lastCloseRequestUtc).TotalSeconds >= 5)
+            {
+                CancelWorkingOrders("flat-by");
+                CloseAllPositions(nowUtc, "flat-by");
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Orders, positions, executions
+        // ------------------------------------------------------------------
+
+        private void OnTradeAdded(Trade trade)
+        {
+            // No _stopping check: closing fills during FlattenOnStop must still be recorded.
+            if (trade == null || !IsOurAccount(trade.Account)) return;
+            if (trade.Price <= 0 || trade.Quantity <= 0) return;
+            lock (_sync)
+            {
+                if (_current == null) return;
+                Leg leg = _current.Legs.FirstOrDefault(l => SameSymbol(l.Slot.Symbol, trade.Symbol));
+                if (leg == null) return;
+
+                double fee = PnlNumber(trade, "Fee");
+                bool isEntry = (!string.IsNullOrEmpty(leg.EntryOrderId) && trade.OrderId == leg.EntryOrderId)
+                               || (_state == BasketState.Entering && trade.Side == leg.Side && leg.EntryQty < QtyPerLeg);
+                if (isEntry)
+                {
+                    leg.EntryQty += trade.Quantity;
+                    leg.EntryNotional += trade.Price * trade.Quantity;
+                }
+                else if (trade.Side != leg.Side && leg.ExitQty < leg.EntryQty)
+                {
+                    leg.ExitQty += trade.Quantity;
+                    leg.ExitNotional += trade.Price * trade.Quantity;
+                }
+                else
+                {
+                    Log($"Unmatched execution on {leg.Slot.Key}: {trade.Side} {trade.Quantity} @ {trade.Price} (order {trade.OrderId}).",
+                        StrategyLoggingLevel.Error);
+                    return;
+                }
+                if (!double.IsNaN(fee)) leg.BrokerFees += Math.Abs(fee);
+                leg.EstimatedFees += trade.Quantity * leg.Slot.FeePerSide;
+            }
+        }
+
+        private bool AnyPositionsOrWorkingOrders()
+        {
+            return Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && IsBasketSymbol(p.Symbol))
+                || Core.Instance.Orders.Any(o => IsOurAccount(o.Account) && IsBasketSymbol(o.Symbol) && IsWorking(o));
+        }
+
+        private bool HasPosition(Slot slot)
+        {
+            return Core.Instance.Positions.Any(p => IsOurAccount(p.Account) && SameSymbol(p.Symbol, slot.Symbol));
+        }
+
+        private static bool IsWorking(Order o)
+        {
+            return o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled;
         }
 
         private void CancelWorkingOrders(string reason)
         {
-            List<Order> working = Core.Instance.Orders.Where(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
-                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled)).ToList();
-            foreach (Order order in working)
+            foreach (Order order in Core.Instance.Orders
+                         .Where(o => IsOurAccount(o.Account) && IsBasketSymbol(o.Symbol) && IsWorking(o)).ToList())
             {
                 TradingOperationResult result = Core.Instance.CancelOrder((IOrder)order);
-                if (result.Status == TradingOperationResultStatus.Success)
-                    Log($"Working order cancelled ({reason}): id={order.Id}.", StrategyLoggingLevel.Trading);
-                else
-                    Log($"Failed to cancel working order ({reason}): id={order.Id}: {result.Message}.",
-                        StrategyLoggingLevel.Error);
+                if (result.Status != TradingOperationResultStatus.Success)
+                    Log($"Cancel failed ({reason}): order {order.Id} {order.Symbol?.Name}: {result.Message}", StrategyLoggingLevel.Error);
             }
         }
 
-        private void ReconcileOrphanedPositions(DateTime nowUtc)
+        // Per-symbol close bookkeeping. A close is a market order on the opposite side, so
+        // re-sending one while the platform's position view is stale could open a new position.
+        private sealed class CloseTrack
         {
-            if (nowUtc < _nextReconcileUtc) return;
-            _nextReconcileUtc = nowUtc.AddSeconds(2);
-            if (_paperPosition != null || _paperEntryPending || CurrentAccount == null || CurrentSymbol == null) return;
+            public DateTime AcceptedUtc = DateTime.MinValue; // last close the broker accepted
+            public int Refusals;                              // consecutive refusals
+            public bool GaveUp;
+        }
 
-            Position orphan = Core.Instance.Positions.FirstOrDefault(
-                p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol));
-            if (orphan == null) return;
-            CloseUnexpectedPosition(orphan, "found during periodic reconciliation with no local tracking");
+        private const int CloseAcceptedWaitSeconds = 60; // after an accepted close, wait this long for the fill
+        private const int CloseMaxRefusals = 5;          // stop retrying a symbol after this many refusals in a row
+        private readonly Dictionary<string, CloseTrack> _closeTracks = new Dictionary<string, CloseTrack>();
+
+        private void ResetCloseTracking(bool keepAccepted)
+        {
+            if (!keepAccepted) { _closeTracks.Clear(); return; }
+            foreach (CloseTrack t in _closeTracks.Values) { t.Refusals = 0; t.GaveUp = false; }
+        }
+
+        private void CloseAllPositions(DateTime nowUtc, string reason)
+        {
+            _lastCloseRequestUtc = nowUtc;
+            List<Position> open = Core.Instance.Positions
+                .Where(p => IsOurAccount(p.Account) && IsBasketSymbol(p.Symbol)).ToList();
+
+            // Forget symbols that are no longer open.
+            foreach (string key in _closeTracks.Keys.ToList())
+                if (!open.Any(p => p.Symbol?.Name == key)) _closeTracks.Remove(key);
+
+            foreach (Position p in open)
+            {
+                string key = p.Symbol?.Name ?? "?";
+                if (!_closeTracks.TryGetValue(key, out CloseTrack track))
+                    _closeTracks[key] = track = new CloseTrack();
+
+                if (track.GaveUp) continue;
+                if (track.AcceptedUtc != DateTime.MinValue)
+                {
+                    if ((nowUtc - track.AcceptedUtc).TotalSeconds < CloseAcceptedWaitSeconds) continue; // still waiting for the fill
+                    Log($"Close for {key} was accepted {CloseAcceptedWaitSeconds}s ago but the position still shows open; sending again ({reason}).",
+                        StrategyLoggingLevel.Error);
+                }
+
+                TradingOperationResult result = Core.Instance.ClosePosition(p);
+                if (result.Status == TradingOperationResultStatus.Success)
+                {
+                    track.AcceptedUtc = nowUtc;
+                    track.Refusals = 0;
+                    Log($"Close requested ({reason}): {key} {p.Side} {p.Quantity}.", StrategyLoggingLevel.Trading);
+                }
+                else if (++track.Refusals >= CloseMaxRefusals)
+                {
+                    track.GaveUp = true;
+                    _current?.AddDetail($"close retries stopped on {key} after {CloseMaxRefusals} refusals");
+                    Log($"Close REFUSED {CloseMaxRefusals} times in a row on {key} ({result.Message}). No more retries for {key}. " +
+                        "The position may already be flat at the broker and the platform's view stale - check the broker and flatten manually if needed.",
+                        StrategyLoggingLevel.Error);
+                }
+                else
+                {
+                    Log($"Close refused ({reason}): {key} {p.Side} {p.Quantity}: {result.Message}. " +
+                        $"Refusal {track.Refusals}/{CloseMaxRefusals}; will retry.", StrategyLoggingLevel.Error);
+                }
+            }
         }
 
         private bool IsOurAccount(Account account)
@@ -821,195 +1226,147 @@ namespace strategyTesting
                 && (ReferenceEquals(account, CurrentAccount) || account.Id == CurrentAccount.Id);
         }
 
-        private bool IsOurSymbol(Symbol symbol)
+        private bool IsBasketSymbol(Symbol symbol)
         {
-            if (symbol == null || CurrentSymbol == null) return false;
-            if (ReferenceEquals(symbol, CurrentSymbol) || symbol.Id == CurrentSymbol.Id) return true;
-            return !string.IsNullOrEmpty(symbol.Root) && !string.IsNullOrEmpty(CurrentSymbol.Root)
-                && string.Equals(symbol.Root, CurrentSymbol.Root, StringComparison.OrdinalIgnoreCase);
+            return _slots.Any(s => SameSymbol(s.Symbol, symbol));
+        }
+
+        private static bool SameSymbol(Symbol a, Symbol b)
+        {
+            return a != null && b != null && (ReferenceEquals(a, b) || a.Id == b.Id);
         }
 
         // ------------------------------------------------------------------
-        // Trade log: prices come from the executions, not Position P&L fields
-        // (those were unreliable on this connection; see algoTrading). The strategy
-        // holds one position at a time, so the entry is the execution of our entry
-        // order and the exit is any later unclaimed opposite-side execution.
+        // Logs
         // ------------------------------------------------------------------
 
-        private void OnTradeAdded(Trade trade)
+        private void FinishAttempt(AttemptLog log, string outcome, string detail)
         {
-            if (_stopping || trade == null) return;
-            if (!IsOurAccount(trade.Account) || !IsOurSymbol(trade.Symbol)) return;
-            if (trade.Price <= 0 || trade.Quantity <= 0) return;
-
-            TradeRecord completed = null;
-            lock (_sync)
-            {
-                _executions.Add(new Execution
-                {
-                    OrderId = trade.OrderId,
-                    Side = trade.Side,
-                    Price = trade.Price,
-                    Quantity = trade.Quantity,
-                    Fee = PnlNumber(trade, "Fee"),
-                    Seen = DateTime.Now
-                });
-                _executions.RemoveAll(x => x.Claimed && (DateTime.Now - x.Seen).TotalMinutes > 5);
-                if (_executions.Count > 200) _executions.RemoveRange(0, _executions.Count - 200);
-
-                if (_openRecord != null) ApplyExecutions(_openRecord);
-                foreach (TradeRecord pending in _pendingTrades.ToList())
-                {
-                    ApplyExecutions(pending);
-                    if (pending.ExitComplete)
-                    {
-                        _pendingTrades.Remove(pending);
-                        completed = pending;
-                        break;
-                    }
-                }
-            }
-            if (completed != null) CompleteTrade(completed);
+            log.Outcome = outcome;
+            if (!string.IsNullOrEmpty(detail)) log.AddDetail(detail);
+            _attemptsLogged++;
+            if (outcome != "TIME_EXIT" && outcome != "CAP_EXIT" && outcome != "NO_BASKET" && outcome != "EXIT_FAILURE")
+                Log($"Attempt {log.Spec.Number}: {outcome} - {log.Detail}. -> IDLE", StrategyLoggingLevel.Trading);
+            WriteAttemptRow(log);
         }
 
-        private readonly List<TradeRecord> _pendingTrades = new List<TradeRecord>();
-
-        // Caller holds _sync.
-        private void ApplyExecutions(TradeRecord record)
+        private string AttemptsHeader()
         {
-            foreach (Execution x in _executions)
-            {
-                if (x.Claimed || x.Seen < record.SubmitTime) continue;
-
-                bool isEntry = !string.IsNullOrEmpty(record.EntryOrderId)
-                    ? x.OrderId == record.EntryOrderId
-                    : x.Side == record.Side && record.ExitQty == 0 && !record.Closed && record.EntryQty < PaperQuantity;
-                if (isEntry)
-                {
-                    record.EntryQty += x.Quantity;
-                    record.EntryNotional += x.Price * x.Quantity;
-                    AddFee(record, x.Fee);
-                    x.Claimed = true;
-                    continue;
-                }
-
-                if (record.EntryQty <= 0 && double.IsNaN(record.PositionOpenPrice)) continue; // not filled yet
-                if (record.ExitComplete || x.Side == record.Side) continue;
-
-                record.ExitQty += x.Quantity;
-                record.ExitNotional += x.Price * x.Quantity;
-                AddFee(record, x.Fee);
-                x.Claimed = true;
-            }
+            var cols = new List<string> { "date", "attempt_number", "entry_time", "exit_reason", "detail" };
+            cols.AddRange(SymbolSpecs.Select(s => "return_pct_" + s.Key));
+            cols.AddRange(new[] { "mhg_window_ticks", "mhg_removed", "long_legs", "short_legs", "ranking_spread_pct" });
+            cols.AddRange(SymbolSpecs.Select(s => "entry_ref_" + s.Key));
+            cols.AddRange(SymbolSpecs.Select(s => "entry_fill_" + s.Key));
+            cols.AddRange(SymbolSpecs.Select(s => "slippage_ticks_" + s.Key));
+            cols.AddRange(SymbolSpecs.Select(s => "touch_at_send_" + s.Key));
+            cols.AddRange(SymbolSpecs.Select(s => "touch_slippage_ticks_" + s.Key));
+            cols.AddRange(new[] { "basket_filled_time", "exit_time" });
+            cols.AddRange(SymbolSpecs.Select(s => "exit_price_" + s.Key));
+            cols.AddRange(new[] { "exit_price_estimated", "gross_pnl", "fees", "net_pnl", "fee_source", "fees_broker", "fees_estimated" });
+            cols.AddRange(SymbolSpecs.Select(s => "leg_pnl_" + s.Key));
+            cols.AddRange(new[] { "mnq_share_of_basket_pnl", "mae", "mfe", "daily_pnl_after", "cumulative_pnl_after" });
+            return string.Join(",", cols);
         }
 
-        private static void AddFee(TradeRecord record, double fee)
-        {
-            if (double.IsNaN(fee)) return;
-            record.Fees = (double.IsNaN(record.Fees) ? 0 : record.Fees) + Math.Abs(fee);
-        }
+        private const string DaysHeader = "date,attempts_logged,baskets_traded,daily_net_pnl,cumulative_pnl,day_killed,strategy_killed,note";
 
-        // Caller holds _sync.
-        private void RegisterClosedTrade(TradeRecord record)
+        private void WriteAttemptRow(AttemptLog log)
         {
-            ApplyExecutions(record);
-            if (record.ExitComplete)
+            Leg LegOf(string key) => log.Legs.FirstOrDefault(l => l.Slot.Key == key);
+            double LegPnl(Leg l) => l == null || l.EntryQty <= 0 || double.IsNaN(l.ExitFill)
+                ? double.NaN : l.Dir * (l.ExitFill - l.EntryFill) * l.Slot.DollarsPerPoint * l.EntryQty;
+
+            var v = new List<string>
             {
-                // Write outside the strategy lock.
-                Task.Run(() => CompleteTrade(record));
-                return;
-            }
-            _pendingTrades.Add(record);
-            var timer = new System.Timers.Timer(ExitFillTimeoutSeconds * 1000) { AutoReset = false };
-            timer.Elapsed += (s, e) =>
-            {
-                lock (_sync)
-                {
-                    if (!_pendingTrades.Remove(record)) return;
-                }
-                Log($"No closing execution seen for signal {record.SignalId} after {ExitFillTimeoutSeconds}s; " +
-                    "recording the trade with exit price and P&L blank.", StrategyLoggingLevel.Error);
-                CompleteTrade(record);
+                log.DateEt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                log.Spec.Number.ToString(CultureInfo.InvariantCulture),
+                (log.DateEt + log.Spec.Entry).ToString("HH:mm", CultureInfo.InvariantCulture),
+                log.Outcome,
+                CsvText(log.Detail)
             };
-            record.Fallback = timer;
-            timer.Start();
+            foreach (var s in SymbolSpecs) v.Add(Csv(Get(log.ReturnPct, s.Key), "F4"));
+            v.Add(log.MhgTicks < 0 ? "" : log.MhgTicks.ToString(CultureInfo.InvariantCulture));
+            v.Add(log.MhgTicks < 0 ? "" : (log.MhgRemoved ? "1" : "0"));
+            v.Add(string.Join(";", log.Longs));
+            v.Add(string.Join(";", log.Shorts));
+            v.Add(Csv(log.SpreadPct, "F4"));
+            foreach (var s in SymbolSpecs) v.Add(Csv(Get(log.EntryRef, s.Key), "G10"));
+            foreach (var s in SymbolSpecs) v.Add(Csv(LegOf(s.Key)?.EntryFill, "G10"));
+            foreach (var s in SymbolSpecs) v.Add(Csv(LegOf(s.Key)?.SlippageTicks, "F1"));
+            foreach (var s in SymbolSpecs) v.Add(Csv(LegOf(s.Key)?.TouchAtSend, "G10"));
+            foreach (var s in SymbolSpecs) v.Add(Csv(LegOf(s.Key)?.TouchSlippageTicks, "F1"));
+            v.Add(CsvTime(log.FilledEt));
+            v.Add(CsvTime(log.ExitEt));
+            foreach (var s in SymbolSpecs)
+            {
+                Leg l = LegOf(s.Key);
+                v.Add(l == null || l.EntryQty <= 0 ? "" : Csv(l.ExitFill, "G10"));
+            }
+            v.Add(log.Legs.Any(l => l.EntryQty > 0) ? (log.ExitPriceEstimated ? "1" : "0") : "");
+            v.Add(Csv(log.Gross));
+            v.Add(Csv(log.Fees));
+            v.Add(Csv(log.Net));
+            v.Add(log.Legs.Count == 0 ? "" : (log.Legs[0].UseEstimatedFees ? "estimated" : "broker"));
+            v.Add(Csv(log.BrokerFees));
+            v.Add(Csv(log.EstimatedFees));
+            foreach (var s in SymbolSpecs) v.Add(Csv(LegPnl(LegOf(s.Key))));
+            double mnq = LegPnl(LegOf("MNQ"));
+            v.Add(!double.IsNaN(mnq) && !double.IsNaN(log.Gross) && Math.Abs(log.Gross) > 1e-9 ? Csv(mnq / log.Gross, "F3") : "");
+            v.Add(Csv(log.Mae));
+            v.Add(Csv(log.Mfe));
+            v.Add(Csv(_dailyPnl));
+            v.Add(Csv(_cumulativePnl));
+            AppendCsv(_attemptsCsv, v);
         }
 
-        private void CompleteTrade(TradeRecord r)
+        private void WriteDayRowIfDone(DateTime nowEt)
         {
-            if (System.Threading.Interlocked.Exchange(ref r.Written, 1) != 0) return;
-            r.Fallback?.Stop();
-            r.Fallback?.Dispose();
-            r.Fallback = null;
+            if (_dayRowWritten || !IsTradingDay(_dayEt) || nowEt.Date != _dayEt) return;
+            if (nowEt.TimeOfDay < FlatBy || _state != BasketState.Idle || !_attemptHandled.All(h => h)) return;
+            WriteDayRow("");
+        }
 
-            double entry = r.EntryFill, exit = r.ExitFill;
-            double qty = r.ExitQty > 0 ? r.ExitQty : (r.EntryQty > 0 ? r.EntryQty : PaperQuantity);
-            double dir = r.Side == Side.Buy ? 1.0 : -1.0;
-            double pnlTicks = double.NaN, gross = double.NaN, net = double.NaN;
-            double tickValue = TickValue(entry);
-            if (!double.IsNaN(entry) && !double.IsNaN(exit) && _tickSize > 0)
+        private void WriteDayRow(string note)
+        {
+            _dayRowWritten = true;
+            AppendCsv(_daysCsv, new List<string>
             {
-                pnlTicks = (exit - entry) * dir / _tickSize;
-                if (!double.IsNaN(tickValue)) gross = pnlTicks * tickValue * qty;
-            }
-            if (!double.IsNaN(gross)) net = gross - (double.IsNaN(r.Fees) ? 0 : r.Fees);
+                _dayEt.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture),
+                _attemptsLogged.ToString(CultureInfo.InvariantCulture),
+                _basketsTraded.ToString(CultureInfo.InvariantCulture),
+                Csv(_dailyPnl), Csv(_cumulativePnl),
+                _dayKilled ? "1" : "0", _strategyKilled ? "1" : "0",
+                CsvText(note)
+            });
+            Log($"Day {_dayEt:yyyy-MM-dd}: {_attemptsLogged} attempts, {_basketsTraded} baskets, net {_dailyPnl:F2}, " +
+                $"cumulative {_cumulativePnl:F2}.", StrategyLoggingLevel.Info);
+        }
 
-            string reason = r.ExitReason;
-            if (string.IsNullOrEmpty(reason))
-            {
-                reason = double.IsNaN(pnlTicks) ? "closed (unknown)"
-                    : pnlTicks >= TargetTicks - 0.5 ? "server target"
-                    : pnlTicks <= -(StopTicks - 0.5) ? "server stop"
-                    : "closed elsewhere";
-            }
-
-            string symbolName = CurrentSymbol?.Name ?? "";
-            var values = new List<string>
-            {
-                _runId, r.SignalId, symbolName, r.Side.ToString(), Csv(qty, "F0"),
-                CsvTime(r.EntryTime), CsvTime(r.ExitTime), Csv(entry, "F2"), Csv(exit, "F2"), reason,
-                TargetTicks.ToString(CultureInfo.InvariantCulture), StopTicks.ToString(CultureInfo.InvariantCulture),
-                Csv(r.MaeTicks, "F1"), Csv(r.MfeTicks, "F1"),
-                Csv(net, "F2"),
-                Csv(r.AtEntry?.Adx30), Csv(r.AtEntry?.Plus30), Csv(r.AtEntry?.Minus30),
-                Csv(r.AtEntry?.Adx1m), Csv(r.AtEntry?.Plus1m), Csv(r.AtEntry?.Minus1m),
-                Csv(r.AtExit?.Adx30), Csv(r.AtExit?.Plus30), Csv(r.AtExit?.Minus30),
-                Csv(r.AtExit?.Adx1m), Csv(r.AtExit?.Plus1m), Csv(r.AtExit?.Minus1m)
-            };
+        private void AppendCsv(string path, List<string> values)
+        {
+            string row = string.Join(",", values);
             try
             {
-                lock (_csvLock) File.AppendAllText(_tradeCsv, string.Join(",", values) + Environment.NewLine);
+                lock (_csvLock) File.AppendAllText(path, row + Environment.NewLine);
             }
             catch (Exception ex)
             {
-                Log("Trade CSV write failed: " + ex.Message + " | row: " + string.Join(",", values),
-                    StrategyLoggingLevel.Error);
+                Log("CSV write failed: " + ex.Message + " | row: " + row, StrategyLoggingLevel.Error);
             }
-            Log($"Trade logged {r.SignalId}: {r.Side} {reason}, entry {entry:F2} exit {exit:F2}, " +
-                $"{pnlTicks:F1}t, net {net:F2} (fees {r.Fees:F2}), MAE {r.MaeTicks:F1}t MFE {r.MfeTicks:F1}t.",
-                StrategyLoggingLevel.Trading);
         }
 
-        private readonly object _csvLock = new object();
-
-        private const string CsvHeader =
-            "runId,signalId,symbol,side,quantity,entryTime,exitTime,entryPrice,exitPrice,exitReason," +
-            "takeProfitTicks,stopLossTicks,maeTicks,mfeTicks,netPnL," +
-            "entryAdx30s,entryPlusDi30s,entryMinusDi30s,entryAdx1m,entryPlusDi1m,entryMinusDi1m," +
-            "exitAdx30s,exitPlusDi30s,exitMinusDi30s,exitAdx1m,exitPlusDi1m,exitMinusDi1m";
-
-        // Dollar value of one tick; platform figure first, tick size x lot size as fallback.
-        private double TickValue(double atPrice)
+        // In-memory only: everything starts fresh each time the strategy starts.
+        private void ResetSessionState()
         {
-            if (CurrentSymbol == null || _tickSize <= 0 || double.IsNaN(atPrice)) return double.NaN;
-            try
-            {
-                double cost = CurrentSymbol.GetTickCost(atPrice);
-                if (cost > 0 && !double.IsInfinity(cost)) return cost;
-            }
-            catch { }
-            double lot = CurrentSymbol.LotSize;
-            return lot > 0 ? _tickSize * lot : double.NaN;
+            _cumulativePnl = 0; _strategyKilled = false;
+            _dayEt = DateTime.MinValue; _dailyPnl = 0; _dayKilled = false; _dayRowWritten = false;
+            _attemptsLogged = 0; _basketsTraded = 0;
+            for (int i = 0; i < _attemptHandled.Length; i++) { _attemptHandled[i] = false; _rankingLogged[i] = false; }
+        }
+
+        private static double Get(Dictionary<string, double> d, string key)
+        {
+            return d.TryGetValue(key, out double v) ? v : double.NaN;
         }
 
         // Broker fee members may be plain numbers or PnL items with a Value; NaN if unavailable.
@@ -1045,134 +1402,20 @@ namespace strategyTesting
                 ? "" : value.Value.ToString(format, CultureInfo.InvariantCulture);
         }
 
+        private static string CsvText(string text)
+        {
+            if (string.IsNullOrEmpty(text)) return "";
+            return "\"" + text.Replace("\"", "\"\"") + "\"";
+        }
+
         private static string CsvTime(DateTime value)
         {
-            return value == DateTime.MinValue
-                ? "" : value.ToString("yyyy-MM-dd HH:mm:ss.fff", CultureInfo.InvariantCulture);
+            return value == DateTime.MinValue ? "" : value.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture);
         }
 
-        // ------------------------------------------------------------------
-        // Trading hours
-        // ------------------------------------------------------------------
-
-        // Entry window only (Eastern time of day), same format as strategyTesting.
-        // Add more rows for more windows; an end of 0:00 means "until midnight".
-        private bool IsTradingTimeValid(TimeSpan t)
+        private static string Fmt(double value, string format = "F2")
         {
-            var windows = new (int sh, int sm, int eh, int em)[]
-            {
-                ( 9,  30, 10,  0),
-                //( 10,  0, 16,  0),
-
-            };
-
-            foreach (var (sh, sm, eh, em) in windows)
-            {
-                var start = TimeSpan.FromMinutes(sh * 60 + sm);
-                var end = TimeSpan.FromMinutes(eh * 60 + em);
-                bool inWindow = end == TimeSpan.Zero ? t >= start
-                              : start < end ? t >= start && t < end
-                                            : t >= start || t < end;
-                if (inWindow) return true;
-            }
-            return false;
-        }
-
-        // ------------------------------------------------------------------
-        // Account take profit / stop loss
-        // ------------------------------------------------------------------
-
-        // Account P&L since the baseline balance: realized balance change plus open P&L.
-        private double AccountPnl()
-        {
-            if (CurrentAccount == null) return double.NaN;
-            double baseline = StartingBalance > 0 ? StartingBalance : _baselineBalance;
-            return CurrentAccount.Balance - baseline + OpenPnl();
-        }
-
-        private double OpenPnl()
-        {
-            double total = 0;
-            foreach (Position p in Core.Instance.Positions.Where(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol)))
-            {
-                double pnl = PnlNumber(p, "NetPnL");
-                if (!double.IsNaN(pnl)) total += pnl;
-            }
-            return total;
-        }
-
-        // Returns "" when new entries are allowed, else the reason they are blocked.
-        private string AccountLimitReason()
-        {
-            double pnl = AccountPnl();
-            if (double.IsNaN(pnl)) return "";
-            if (accountTakeProfit > 0 && pnl >= accountTakeProfit)
-            {
-                if (!_accountLimitLogged)
-                    Log($"Account take profit reached (P&L {pnl:F2} >= {accountTakeProfit:F2}); no new entries.",
-                        StrategyLoggingLevel.Trading);
-                _accountLimitLogged = true;
-                return "account_take_profit_hit";
-            }
-            if (accountStopLoss != 0 && pnl <= -Math.Abs(accountStopLoss))
-            {
-                if (!_accountLimitLogged)
-                    Log($"Account stop loss reached (P&L {pnl:F2} <= {-Math.Abs(accountStopLoss):F2}); no new entries.",
-                        StrategyLoggingLevel.Trading);
-                _accountLimitLogged = true;
-                return "account_stop_loss_hit";
-            }
-            _accountLimitLogged = false;
-            return "";
-        }
-
-        // Account P&L at or below the account stop -> close every position and cancel working
-        // orders. Re-checked every tick and by the housekeeping timer until flat. Caller holds _sync.
-        private void CheckAccountStop(DateTime nowUtc)
-        {
-            if (accountStopLoss == 0) return;
-            double pnl = AccountPnl();
-            if (double.IsNaN(pnl) || pnl > -Math.Abs(accountStopLoss))
-            {
-                _accountStopLogged = false;
-                return;
-            }
-            if (!_accountStopLogged)
-                Log($"Account stop loss reached (P&L {pnl:F2} <= {-Math.Abs(accountStopLoss):F2}); closing all positions.",
-                    StrategyLoggingLevel.Trading);
-            _accountStopLogged = true;
-            FlattenAll(nowUtc, "account stop loss");
-        }
-
-        private void FlattenAll(DateTime nowUtc, string label)
-        {
-            if (nowUtc < _nextFlattenUtc || CurrentAccount == null || CurrentSymbol == null) return;
-            List<Position> positions = Core.Instance.Positions
-                .Where(p => IsOurAccount(p.Account) && IsOurSymbol(p.Symbol)).ToList();
-            bool working = Core.Instance.Orders.Any(o => IsOurAccount(o.Account) && IsOurSymbol(o.Symbol)
-                && (o.Status == OrderStatus.Opened || o.Status == OrderStatus.PartiallyFilled));
-            if (positions.Count == 0 && !working) return;
-
-            _nextFlattenUtc = nowUtc.AddSeconds(5); // do not stack close orders while one is in flight
-            if (working) CancelWorkingOrders(label);
-
-            foreach (Position p in positions)
-            {
-                bool tracked = _paperPosition != null && p.Id == _paperPosition.Id;
-                TradingOperationResult result = Core.Instance.ClosePosition(p);
-                if (result.Status == TradingOperationResultStatus.Success)
-                {
-                    Log($"{label} close requested: position {p.Id} {p.Side} {p.Quantity}.", StrategyLoggingLevel.Trading);
-                    if (tracked)
-                    {
-                        if (!_exitRequested) _exitReason = label;
-                        _exitRequested = true;
-                    }
-                }
-                else
-                    Log($"{label} close FAILED for position {p.Id}: {result.Message}. Retrying in 5s.",
-                        StrategyLoggingLevel.Error);
-            }
+            return double.IsNaN(value) ? "n/a" : value.ToString(format, CultureInfo.InvariantCulture);
         }
 
         // ------------------------------------------------------------------
@@ -1192,7 +1435,6 @@ namespace strategyTesting
         {
             if (_stopping) return;
             SubscribeToConnection(connection);
-            Log("Connection added: " + connection.Name, StrategyLoggingLevel.Info);
         }
 
         private void OnConnectionRemoved(Connection connection)
@@ -1210,7 +1452,7 @@ namespace strategyTesting
             if (args.NewState == ConnectionState.Disconnected)
             {
                 Log("Disconnected: " + connection.Name, StrategyLoggingLevel.Error);
-                ResetAfterDataGap();
+                MarkDataGap();
             }
             else if (args.NewState == ConnectionState.Connected)
             {
@@ -1232,7 +1474,7 @@ namespace strategyTesting
             {
                 _lastKnownConnected = false;
                 Log("Connection watchdog: no connected data connection.", StrategyLoggingLevel.Error);
-                ResetAfterDataGap();
+                MarkDataGap();
             }
             else if (connected && !_lastKnownConnected)
             {
@@ -1242,44 +1484,50 @@ namespace strategyTesting
             }
         }
 
+        // Our own trade counts have a hole now; fall back to bar tick counts until a full window passes.
+        private void MarkDataGap()
+        {
+            lock (_sync)
+            {
+                foreach (Slot s in _slots) s.CountingSinceEt = DateTime.MaxValue;
+                if (_state != BasketState.Idle)
+                    Log($"Connection lost while {_state}; the strategy keeps managing the basket when data returns. " +
+                        "Check the positions.", StrategyLoggingLevel.Error);
+            }
+        }
+
         private void RebindAfterReconnect()
         {
             lock (_sync)
             {
-                if (_stopping || _rebindInProgress || CurrentSymbol == null) return;
+                if (_stopping || _rebindInProgress) return;
                 _rebindInProgress = true;
                 try
                 {
+                    DateTime nextMinuteEt = TruncateMinute(ToEastern(DateTime.UtcNow)).AddMinutes(1);
+                    foreach (Slot s in _slots)
+                    {
+                        s.Symbol.NewLast -= OnNewLast;
+                        s.Symbol.NewQuote -= OnNewQuote;
+                        Symbol fresh = Core.GetSymbol(s.Symbol.CreateInfo());
+                        if (fresh != null) s.Symbol = fresh;
+                        else Log($"Reconnect: {s.Key} symbol not reacquired.", StrategyLoggingLevel.Error);
+                        s.Symbol.NewLast += OnNewLast;
+                        s.Symbol.NewQuote += OnNewQuote;
+                        s.QuoteTimeUtc = DateTime.MinValue;   // wait for a fresh quote after reconnect
+                        s.CountingSinceEt = nextMinuteEt;
+                    }
                     string accountId = CurrentAccount?.Id;
-                    var symbolInfo = CurrentSymbol.CreateInfo();
-                    CurrentSymbol.NewLast -= OnNewLast;
-                    CurrentSymbol.NewQuote -= OnNewQuote;
-                    CurrentSymbol = Core.GetSymbol(symbolInfo);
-                    if (CurrentSymbol == null)
-                        throw new InvalidOperationException("Could not reacquire the selected symbol.");
-                    _tickSize = CurrentSymbol.TickSize;
-                    CurrentSymbol.NewLast += OnNewLast;
-                    CurrentSymbol.NewQuote += OnNewQuote;
-
                     if (!string.IsNullOrEmpty(accountId))
                     {
                         Account account = Core.Instance.Accounts.FirstOrDefault(a => a.Id == accountId);
                         if (account != null) CurrentAccount = account;
-                        else Log("Reconnect warning: selected account was not reacquired.", StrategyLoggingLevel.Error);
+                        else Log("Reconnect: account not reacquired.", StrategyLoggingLevel.Error);
                     }
-
                     Core.Instance.TradeAdded -= OnTradeAdded;
                     Core.Instance.TradeAdded += OnTradeAdded;
-                    Core.Instance.PositionAdded -= OnPositionAdded;
-                    Core.Instance.PositionRemoved -= OnPositionRemoved;
-                    Core.Instance.PositionAdded += OnPositionAdded;
-                    Core.Instance.PositionRemoved += OnPositionRemoved;
-
-                    if (!LoadHistory())
-                        Log("Reconnect: bars/indicator reload failed; no new signals until restart.",
-                            StrategyLoggingLevel.Error);
-                    else
-                        Log($"Reattached {CurrentSymbol.Name} and reloaded bars.", StrategyLoggingLevel.Info);
+                    if (!LoadHistories())
+                        Log("Reconnect: bar reload failed; ranking may use stale bars.", StrategyLoggingLevel.Error);
                 }
                 catch (Exception ex)
                 {
@@ -1292,26 +1540,30 @@ namespace strategyTesting
             }
         }
 
-        private void ResetAfterDataGap()
-        {
-            lock (_sync)
-            {
-                if (_paperEntryPending || _paperPosition != null)
-                {
-                    _paperTradingBlockedAfterReconnect = true;
-                    Log("Paper entries blocked after connection loss. Restart the strategy after reconciling the account and orders.",
-                        StrategyLoggingLevel.Error);
-                }
-            }
-        }
+        // ------------------------------------------------------------------
+        // Time
+        // ------------------------------------------------------------------
 
         private static readonly TimeZoneInfo Eastern =
             TimeZoneInfo.FindSystemTimeZoneById("Eastern Standard Time");
 
         private static DateTime ToEastern(DateTime utc)
         {
-            DateTime normalized = utc.Kind == DateTimeKind.Utc ? utc : utc.ToUniversalTime();
+            DateTime normalized = utc.Kind == DateTimeKind.Utc ? utc
+                : utc.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(utc, DateTimeKind.Utc)
+                : utc.ToUniversalTime();
             return TimeZoneInfo.ConvertTimeFromUtc(normalized, Eastern);
+        }
+
+        private static DateTime TruncateMinute(DateTime t)
+        {
+            return new DateTime(t.Year, t.Month, t.Day, t.Hour, t.Minute, 0, t.Kind);
+        }
+
+        private static bool IsTradingDay(DateTime dateEt)
+        {
+            return dateEt != DateTime.MinValue
+                && dateEt.DayOfWeek != DayOfWeek.Saturday && dateEt.DayOfWeek != DayOfWeek.Sunday;
         }
     }
 }
