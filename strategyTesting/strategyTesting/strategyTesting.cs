@@ -14,9 +14,10 @@ namespace strategyTesting
     ///
     /// One attempt per day (ET): rank 9:15-9:29, enter 9:30, exit 10:14. For the attempt the 15 one-minute bars before entry are
     /// ranked by return; long the top 3, short the bottom 2 (top 2 / bottom 2 if MHG is thin and
-    /// removed). Skipped if the top-to-bottom spread is under 0.10%. All legs are entered
-    /// together at market, only if every leg's bid/ask is fresh and its spread normal (else
-    /// NO_BASKET with no orders sent); any leg unfilled after 5 minutes flattens the basket. Exits: the attempt's exit time
+    /// removed). Skipped if the top-to-bottom spread is under 0.10%. Legs whose bid/ask is fresh
+    /// and spread normal are entered at market at entry time; any other leg waits and joins when
+    /// its quote is good, up to 5 minutes after entry time, else it is dropped. An on-time leg
+    /// unfilled after 5 minutes flattens the basket; a late leg that fails is just dropped. Exits: the attempt's exit time
     /// (TIME_EXIT), or basket P&L at or below -$250 x quantity at a 1-minute close once 5 minutes have
     /// passed since entry time (CAP_EXIT). Cumulative -$1000 x quantity kill switch (this run only).
     ///
@@ -113,11 +114,14 @@ namespace strategyTesting
         private double MaxCumulativeDrawdown => MaxCumulativeDrawdownPerContract * QtyPerLeg;
 
         // Pre-send check, per leg: the bid/ask must have updated within QuoteMaxAgeSeconds and the
-        // spread must be at most MaxSpreadTicks. If any leg fails, the attempt is NO_BASKET and no
-        // orders are sent. Fills are not checked afterwards (no open-then-close).
+        // spread must be at most MaxSpreadTicks. Legs that pass are sent at entry time; a leg that
+        // fails waits and joins the basket as soon as its quote passes, up to LateJoinMinutes after
+        // entry time; after that it is dropped and the basket runs without it. Fills are not
+        // checked afterwards (no open-then-close).
         private const int QuoteMaxAgeSeconds = 15;
         private const double MaxSpreadTicks = 5;
         private const int EntryFillTimeoutMinutes = 5;
+        private const int LateJoinMinutes = 5;
 
         // Wait this long after the entry minute starts so the last trades of the previous
         // minute are in the bars. An attempt is skipped if the strategy wasn't running within
@@ -154,6 +158,12 @@ namespace strategyTesting
             public int Dir;
             public double EntryRef;
             public string EntryOrderId;
+            // Sent = entry order sent. A leg whose quote failed the pre-send check waits (not Sent)
+            // and joins when its quote is good; Dropped = never joined, or its late order failed.
+            public bool Sent, Late, Dropped, Settled;
+            public DateTime SentUtc;
+            public bool Active => Sent && !Dropped;
+            public bool Filled(int qty) => EntryQty >= qty - 1e-9;
             public bool OrderFailed;
             public string FailNote = "";
             public double EntryQty, EntryNotional, ExitQty, ExitNotional;
@@ -782,15 +792,11 @@ namespace strategyTesting
                 $"LONG {string.Join(",", log.Longs)} / SHORT {string.Join(",", log.Shorts)}.", StrategyLoggingLevel.Trading);
 
             // Pre-entry checks, before any order is sent. A failure here still uses the attempt.
+            // A bad quote only holds back that leg (see LateJoinMinutes); it does not block the basket.
             string block = "";
             if (CurrentAccount == null) block = "no account";
             else if (!Core.Instance.Connections.All.Any(c => c.State == ConnectionState.Connected)) block = "not connected";
             else if (AnyPositionsOrWorkingOrders()) block = "a position or working order already exists on a basket symbol";
-            else
-            {
-                var problems = longs.Concat(shorts).Select(s => QuoteProblem(s, nowUtc)).Where(x => x.Length > 0).ToList();
-                if (problems.Count > 0) block = "quote check failed: " + string.Join("; ", problems);
-            }
             if (block.Length > 0)
             {
                 FinishAttempt(log, "NO_BASKET", "not entered: " + block);
@@ -813,17 +819,93 @@ namespace strategyTesting
                 });
             }
 
+            var waiting = new List<string>();
             foreach (Leg leg in log.Legs)
-                PlaceEntry(leg, a.Number);
+            {
+                string problem = QuoteProblem(leg.Slot, nowUtc);
+                if (problem.Length == 0) PlaceEntry(leg, a.Number, nowUtc);
+                else waiting.Add(problem);
+            }
+            if (waiting.Count > 0)
+            {
+                log.AddDetail("waiting to join: " + string.Join("; ", waiting));
+                Log($"Attempt {a.Number}: {waiting.Count} leg(s) held back by the quote check, will join when the quote is good " +
+                    $"(until {a.Entry.Add(TimeSpan.FromMinutes(LateJoinMinutes)):hh\\:mm}): {string.Join("; ", waiting)}.",
+                    StrategyLoggingLevel.Trading);
+            }
 
             Log($"Attempt {a.Number}: RANKING -> entering basket; " +
                 string.Join(", ", log.Legs.Select(l => $"{l.Side} {l.Slot.Key} ref {l.EntryRef} " +
-                    $"{(l.Side == Side.Buy ? "ask" : "bid")} {Fmt(l.TouchAtSend, "G10")}" +
+                    (!l.Sent ? "WAITING for quote" : $"{(l.Side == Side.Buy ? "ask" : "bid")} {Fmt(l.TouchAtSend, "G10")}") +
                     (l.OrderFailed ? $" FAILED ({l.FailNote})" : ""))) + ".", StrategyLoggingLevel.Trading);
         }
 
-        private void PlaceEntry(Leg leg, int attemptNumber)
+        // Send entries for held-back legs whose quote is now good; drop them after the deadline.
+        private void JoinWaitingLegs(DateTime nowUtc, DateTime nowEt)
         {
+            AttemptLog log = _current;
+            DateTime deadlineEt = log.DateEt + log.Spec.Entry + TimeSpan.FromMinutes(LateJoinMinutes);
+            foreach (Leg leg in log.Legs.Where(l => !l.Sent && !l.Dropped))
+            {
+                if (nowEt >= deadlineEt)
+                {
+                    leg.Dropped = true;
+                    string why = QuoteProblem(leg.Slot, nowUtc);
+                    log.AddDetail($"LEG_DROPPED: {leg.Slot.Key} never passed the quote check ({why})");
+                    Log($"Attempt {log.Spec.Number}: LEG_DROPPED - {leg.Slot.Key} quote still not good at {deadlineEt:HH:mm} ({why}); " +
+                        "basket continues without it.", StrategyLoggingLevel.Error);
+                    continue;
+                }
+                if (QuoteProblem(leg.Slot, nowUtc).Length > 0) continue;
+                leg.Late = true;
+                PlaceEntry(leg, log.Spec.Number, nowUtc);
+                log.AddDetail($"{leg.Slot.Key} joined late at {nowEt:HH:mm:ss}");
+                Log($"Attempt {log.Spec.Number}: {leg.Slot.Key} quote now good; joining late - {leg.Side} at market " +
+                    $"({leg.TouchSource} {Fmt(leg.TouchAtSend, "G10")}){(leg.OrderFailed ? $" FAILED ({leg.FailNote})" : "")}.",
+                    StrategyLoggingLevel.Trading);
+            }
+        }
+
+        // A late leg that was refused or never filled is dropped instead of ending the basket.
+        private void CheckLateLegs(DateTime nowUtc)
+        {
+            AttemptLog log = _current;
+            foreach (Leg leg in log.Legs.Where(l => l.Late && l.Active && !l.Settled && !l.Filled(QtyPerLeg)))
+            {
+                string problem = null;
+                if (leg.OrderFailed) problem = $"order failed: {leg.FailNote}";
+                else if (leg.EntryQty <= 0)
+                {
+                    Order order = Core.Instance.Orders.FirstOrDefault(o => o.Id == leg.EntryOrderId);
+                    if (order != null && (order.Status == OrderStatus.Refused || order.Status == OrderStatus.Cancelled))
+                        problem = $"order {order.Status}";
+                }
+                if (problem == null && nowUtc >= leg.SentUtc.AddMinutes(EntryFillTimeoutMinutes))
+                {
+                    problem = $"unfilled after {EntryFillTimeoutMinutes} min";
+                    Order order = Core.Instance.Orders.FirstOrDefault(o => o.Id == leg.EntryOrderId);
+                    if (order != null && IsWorking(order)) Core.Instance.CancelOrder((IOrder)order);
+                }
+                if (problem == null) continue;
+                if (leg.EntryQty > 0)
+                {
+                    log.AddDetail($"{leg.Slot.Key} late entry partly filled ({leg.EntryQty}/{QtyPerLeg}): {problem}");
+                    Log($"Attempt {log.Spec.Number}: {leg.Slot.Key} late entry partly filled ({leg.EntryQty}/{QtyPerLeg}): {problem}; " +
+                        "keeping the filled part.", StrategyLoggingLevel.Error);
+                    leg.Settled = true; // don't re-check this leg
+                    continue;
+                }
+                leg.Dropped = true;
+                log.AddDetail($"LEG_DROPPED: {leg.Slot.Key} late entry {problem}");
+                Log($"Attempt {log.Spec.Number}: LEG_DROPPED - {leg.Slot.Key} late entry {problem}; basket continues without it.",
+                    StrategyLoggingLevel.Error);
+            }
+        }
+
+        private void PlaceEntry(Leg leg, int attemptNumber, DateTime nowUtc)
+        {
+            leg.Sent = true;
+            leg.SentUtc = nowUtc;
             Symbol sym = leg.Slot.Symbol;
             var p = new PlaceOrderRequestParameters
             {
@@ -853,7 +935,11 @@ namespace strategyTesting
         private void ManageEntering(DateTime nowUtc, DateTime nowEt)
         {
             AttemptLog log = _current;
-            foreach (Leg leg in log.Legs)
+            JoinWaitingLegs(nowUtc, nowEt);
+            CheckLateLegs(nowUtc);
+
+            // Initial (on-time) legs: any failure ends the attempt as before.
+            foreach (Leg leg in log.Legs.Where(l => l.Sent && !l.Late))
             {
                 if (leg.OrderFailed)
                 {
@@ -871,20 +957,34 @@ namespace strategyTesting
                 }
             }
 
-            if (log.Legs.All(l => l.EntryQty >= QtyPerLeg - 1e-9))
+            // Every sent leg filled (or settled) and at least one in: the basket is open. Legs still
+            // waiting for a quote keep trying to join from ManageInBasket.
+            List<Leg> active = log.Legs.Where(l => l.Active).ToList();
+            if (active.Count > 0 && active.All(l => l.Filled(QtyPerLeg) || l.Settled))
             {
                 _state = BasketState.InBasket;
                 log.FilledEt = nowEt;
                 _lastMinuteEvaluatedEt = TruncateMinute(nowEt);
+                string waitingNow = string.Join(",", log.Legs.Where(l => !l.Sent && !l.Dropped).Select(l => l.Slot.Key));
                 Log($"Attempt {log.Spec.Number}: IN_BASKET; fills " +
-                    string.Join(", ", log.Legs.Select(l => $"{l.Side} {l.Slot.Key} {l.EntryFill} (ref {l.EntryRef} {l.SlippageTicks:F1}t, {l.TouchSource} {Fmt(l.TouchAtSend, "G10")} {Fmt(l.TouchSlippageTicks, "F1")}t)")) + ".",
+                    string.Join(", ", active.Select(l => $"{l.Side} {l.Slot.Key} {l.EntryFill} (ref {l.EntryRef} {l.SlippageTicks:F1}t, {l.TouchSource} {Fmt(l.TouchAtSend, "G10")} {Fmt(l.TouchSlippageTicks, "F1")}t)")) +
+                    (waitingNow.Length > 0 ? $"; still waiting to join: {waitingNow}" : "") + ".",
                     StrategyLoggingLevel.Trading);
                 return;
             }
 
-            if (nowUtc >= _enterStartUtc.AddMinutes(EntryFillTimeoutMinutes))
+            // Nothing sent and nothing left that could join: no basket.
+            if (active.Count == 0 && log.Legs.All(l => l.Dropped))
             {
-                string unfilled = string.Join(",", log.Legs.Where(l => l.EntryQty < QtyPerLeg - 1e-9).Select(l => l.Slot.Key));
+                BeginExit("NO_BASKET", "no leg passed the quote check before the late-join deadline", nowUtc, nowEt);
+                return;
+            }
+
+            Leg slow = log.Legs.FirstOrDefault(l => l.Sent && !l.Late && !l.Filled(QtyPerLeg)
+                                                    && nowUtc >= l.SentUtc.AddMinutes(EntryFillTimeoutMinutes));
+            if (slow != null)
+            {
+                string unfilled = string.Join(",", log.Legs.Where(l => l.Sent && !l.Late && !l.Filled(QtyPerLeg)).Select(l => l.Slot.Key));
                 BeginExit("NO_BASKET", $"unfilled after {EntryFillTimeoutMinutes} min: {unfilled}", nowUtc, nowEt);
             }
         }
@@ -903,8 +1003,12 @@ namespace strategyTesting
                 if (double.IsNaN(log.Mfe) || pnl > log.Mfe) log.Mfe = pnl;
             }
 
+            JoinWaitingLegs(nowUtc, nowEt);
+            CheckLateLegs(nowUtc);
+
             // A leg closed outside the strategy leaves a partial basket: exit the rest.
-            foreach (Leg leg in log.Legs)
+            // Only legs that have a fill are expected to have a position.
+            foreach (Leg leg in log.Legs.Where(l => l.EntryQty > 0))
             {
                 if (HasPosition(leg.Slot)) { leg.MissingSinceUtc = DateTime.MinValue; continue; }
                 if (leg.MissingSinceUtc == DateTime.MinValue) { leg.MissingSinceUtc = nowUtc; continue; }
@@ -961,7 +1065,14 @@ namespace strategyTesting
             log.ExitEt = nowEt;
             log.AddDetail(detail);
             foreach (Leg leg in log.Legs)
+            {
                 leg.ExitPriceFallback = leg.Slot.Symbol?.Last ?? double.NaN;
+                if (!leg.Sent && !leg.Dropped)
+                {
+                    leg.Dropped = true;
+                    log.AddDetail($"{leg.Slot.Key} never joined (basket exited first)");
+                }
+            }
 
             Log($"Attempt {log.Spec.Number}: {reason} - {detail}. Exiting all legs at market.", StrategyLoggingLevel.Trading);
             ResetCloseTracking(keepAccepted: false);
@@ -1104,7 +1215,8 @@ namespace strategyTesting
 
                 double fee = PnlNumber(trade, "Fee");
                 bool isEntry = (!string.IsNullOrEmpty(leg.EntryOrderId) && trade.OrderId == leg.EntryOrderId)
-                               || (_state == BasketState.Entering && trade.Side == leg.Side && leg.EntryQty < QtyPerLeg);
+                               || ((_state == BasketState.Entering || (leg.Late && leg.Active))
+                                   && trade.Side == leg.Side && leg.EntryQty < QtyPerLeg);
                 if (isEntry)
                 {
                     leg.EntryQty += trade.Quantity;
