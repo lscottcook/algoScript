@@ -10,16 +10,15 @@ using TradingPlatform.BusinessLayer;
 namespace strategyTesting
 {
     /// <summary>
-    /// Intraday futures basket: MES, MNQ, MGC, MCL, MHG, one basket at a time, 1 contract per leg
+    /// Intraday futures basket: MES, MNQ, MGC, MCL, MHG, one basket at a time, QtyPerLeg contracts per leg (input, default 1)
     ///
-    /// Three attempts per day (ET). For each attempt the 15 one-minute bars before entry are
+    /// One attempt per day (ET): rank 9:15-9:29, enter 9:30, exit 10:14. For the attempt the 15 one-minute bars before entry are
     /// ranked by return; long the top 3, short the bottom 2 (top 2 / bottom 2 if MHG is thin and
     /// removed). Skipped if the top-to-bottom spread is under 0.10%. All legs are entered
     /// together at market, only if every leg's bid/ask is fresh and its spread normal (else
     /// NO_BASKET with no orders sent); any leg unfilled after 5 minutes flattens the basket. Exits: the attempt's exit time
-    /// (TIME_EXIT), or basket P&L at or below -$250 at a 1-minute close once 5 minutes have
-    /// passed since entry time (CAP_EXIT). Daily -$500 and cumulative -$1000 kill switches.
-    /// Flat by 15:30 ET, always.
+    /// (TIME_EXIT), or basket P&L at or below -$250 x quantity at a 1-minute close once 5 minutes have
+    /// passed since entry time (CAP_EXIT). Cumulative -$1000 x quantity kill switch (this run only).
     ///
     /// Logs: Downloads\Basket_attempts.csv (one row per attempt), Basket_days.csv (one row per
     /// trading day the strategy runs through). Nothing is saved between runs: daily and
@@ -46,6 +45,9 @@ namespace strategyTesting
         [InputParameter("MHG symbol (front month)", 6)]
         public Symbol MhgSymbol { get; set; }
 
+        // Contracts per leg, same for every symbol in the basket. The basket cap scales with it.
+        [InputParameter("Quantity per symbol", 7, 1, 100, 1, 0)]
+        public int QtyPerLeg = 1;
 
         // Fees: per side, per contract, all-in. Defaults are the AMP Futures estimate.
         // On = P&L, cap and limits use these; off = use the fee the broker reports on each fill.
@@ -76,7 +78,6 @@ namespace strategyTesting
         // Constants (spec section 1)
         // ------------------------------------------------------------------
 
-        private const int QtyPerLeg = 1;
 
         private static readonly (string Key, double DollarsPerPoint, double SpecTick)[] SymbolSpecs =
         {
@@ -93,22 +94,23 @@ namespace strategyTesting
             public TimeSpan RankStart, Entry, Exit;
         }
 
+        // Backup stop: one minute after attempt 1's 10:14 time exit.
+        private static readonly TimeSpan FlatBy = new TimeSpan(10, 15, 0);
+
         private static readonly AttemptSpec[] Attempts =
         {
             new AttemptSpec { Number = 1, RankStart = new TimeSpan(9, 15, 0),  Entry = new TimeSpan(9, 30, 0),  Exit = new TimeSpan(10, 14, 0) },
-            new AttemptSpec { Number = 2, RankStart = new TimeSpan(10, 45, 0), Entry = new TimeSpan(11, 00, 0), Exit = new TimeSpan(11, 59, 0) },
-            new AttemptSpec { Number = 3, RankStart = new TimeSpan(14, 45, 0), Entry = new TimeSpan(15, 0, 0),  Exit = new TimeSpan(15, 30, 0) },
         };
 
-        private static readonly TimeSpan FlatBy = new TimeSpan(15, 30, 0);
 
         private const double NoSignalMinSpreadPct = 0.10;
         private const int MhgMinTicksInWindow = 20;
 
-        private const double MaxLossPerBasket = 250.00;
+        private const double MaxLossPerBasketPerContract = 250.00;
+        private double MaxLossPerBasket => MaxLossPerBasketPerContract * QtyPerLeg;
         private const int CapActiveAfterMinutes = 5;
-        private const double MaxLossPerDay = 500.00;
-        private const double MaxCumulativeDrawdown = 1000.00;
+        private const double MaxCumulativeDrawdownPerContract = 1000.00;
+        private double MaxCumulativeDrawdown => MaxCumulativeDrawdownPerContract * QtyPerLeg;
 
         // Pre-send check, per leg: the bid/ask must have updated within QuoteMaxAgeSeconds and the
         // spread must be at most MaxSpreadTicks. If any leg fails, the attempt is NO_BASKET and no
@@ -222,9 +224,9 @@ namespace strategyTesting
         // Daily / cumulative (this run only; reset on every start)
         private DateTime _dayEt = DateTime.MinValue;
         private double _dailyPnl, _cumulativePnl;
-        private bool _dayKilled, _strategyKilled, _dayRowWritten, _flatByLogged;
-        private readonly bool[] _attemptHandled = new bool[3];
-        private readonly bool[] _rankingLogged = new bool[3];
+        private bool _strategyKilled, _dayRowWritten, _flatByLogged;
+        private readonly bool[] _attemptHandled = new bool[Attempts.Length];
+        private readonly bool[] _rankingLogged = new bool[Attempts.Length];
         private int _attemptsLogged, _basketsTraded;
 
         private string _attemptsCsv, _daysCsv;
@@ -239,7 +241,7 @@ namespace strategyTesting
         {
             Name = "strategyTesting";
             Description = "Intraday basket: rank MES/MNQ/MGC/MCL/MHG over 15 minutes, long top 3 / short bottom 2, " +
-                          "time exit or -$250 cap, daily and cumulative kill switches, flat by 15:30 ET.";
+                          "time exit or -$250 x quantity cap, cumulative kill switch (x quantity), backup flat by 10:15 ET.";
         }
 
         // ------------------------------------------------------------------
@@ -280,6 +282,11 @@ namespace strategyTesting
             if (CurrentAccount == null)
             {
                 Log("Account must be selected.", StrategyLoggingLevel.Error);
+                return;
+            }
+            if (QtyPerLeg < 1)
+            {
+                Log("Quantity per symbol must be at least 1.", StrategyLoggingLevel.Error);
                 return;
             }
             if (_slots.Select(s => s.Symbol.Id).Distinct().Count() != _slots.Count)
@@ -361,12 +368,12 @@ namespace strategyTesting
             Log("Basket strategy started. Attempts (ET): " +
                 string.Join("; ", Attempts.Select(a => $"#{a.Number} rank {a.RankStart:hh\\:mm}-{a.Entry.Subtract(TimeSpan.FromMinutes(1)):hh\\:mm}, " +
                                                        $"entry {a.Entry:hh\\:mm}, exit {a.Exit:hh\\:mm}")) +
-                $". Flat by {FlatBy:hh\\:mm}. Entry MARKET, " +
+                $". Backup flat by {FlatBy:hh\\:mm}. Entry MARKET, " +
                 $"{QtyPerLeg} per leg, fill timeout {EntryFillTimeoutMinutes} min, pre-send check: bid/ask under {QuoteMaxAgeSeconds}s old and spread <= {MaxSpreadTicks} ticks. " +
-                $"Cap -${MaxLossPerBasket:F2} after {CapActiveAfterMinutes} min, day -${MaxLossPerDay:F2}, cumulative -${MaxCumulativeDrawdown:F2}. " +
+                $"Cap -${MaxLossPerBasket:F2} after {CapActiveAfterMinutes} min, cumulative -${MaxCumulativeDrawdown:F2}. " +
                 $"P&L uses {(UseFeeEstimates ? "ESTIMATED fees (inputs)" : "BROKER-reported fees")}.",
                 StrategyLoggingLevel.Info);
-            Log($"State: day {_dayEt:yyyy-MM-dd} P&L {_dailyPnl:F2}{(_dayKilled ? " (DAY_KILLED)" : "")}, " +
+            Log($"State: day {_dayEt:yyyy-MM-dd} P&L {_dailyPnl:F2}, " +
                 $"cumulative {_cumulativePnl:F2}{(_strategyKilled ? " (STRATEGY_KILLED)" : "")}. Logs: {_attemptsCsv}, {_daysCsv}.",
                 _strategyKilled ? StrategyLoggingLevel.Error : StrategyLoggingLevel.Info);
         }
@@ -653,10 +660,9 @@ namespace strategyTesting
             DateTime today = nowEt.Date;
             if (today == _dayEt) return;
             if (_dayEt != DateTime.MinValue && IsTradingDay(_dayEt) && !_dayRowWritten)
-                WriteDayRow("strategy was not running at 15:30 this day");
+                WriteDayRow("strategy did not finish this day's attempt");
             _dayEt = today;
             _dailyPnl = 0;
-            _dayKilled = false;
             _dayRowWritten = false;
             _flatByLogged = false;
             _attemptsLogged = 0;
@@ -690,8 +696,6 @@ namespace strategyTesting
                     FinishAttempt(log, "SKIPPED", "strategy was not running at entry time");
                 else if (_strategyKilled)
                     FinishAttempt(log, "STRATEGY_KILLED", $"cumulative P&L {_cumulativePnl:F2}");
-                else if (_dayKilled)
-                    FinishAttempt(log, "DAY_KILLED", $"daily P&L {_dailyPnl:F2}");
                 else if (_state != BasketState.Idle)
                     FinishAttempt(log, "SKIPPED", $"previous basket still {_state}");
                 else
@@ -1039,11 +1043,6 @@ namespace strategyTesting
             Log($"Attempt {log.Spec.Number}: closed {_exitReason}, gross {Fmt(log.Gross)}, fees {Fmt(log.Fees)}, net {Fmt(log.Net)}. " +
                 $"Day {_dailyPnl:F2}, cumulative {_cumulativePnl:F2}. -> IDLE", StrategyLoggingLevel.Trading);
 
-            if (!_dayKilled && _dailyPnl <= -MaxLossPerDay)
-            {
-                _dayKilled = true;
-                Log($"DAY_KILLED: daily P&L {_dailyPnl:F2} <= -{MaxLossPerDay:F2}. No further attempts today.", StrategyLoggingLevel.Trading);
-            }
             if (!_strategyKilled && _cumulativePnl <= -MaxCumulativeDrawdown)
             {
                 _strategyKilled = true;
@@ -1052,7 +1051,7 @@ namespace strategyTesting
             }
         }
 
-        // Never carry a position past 15:30.
+        // Backup stop: never carry a basket position past 10:15 ET.
         private void EnforceFlatBy(DateTime nowUtc, DateTime nowEt)
         {
             if (nowEt.TimeOfDay < FlatBy) return;
@@ -1063,11 +1062,11 @@ namespace strategyTesting
             }
             if (_state == BasketState.Exiting)
             {
-                // Attempt 3's time exit fires at 15:30 itself, so give any exit 30s to complete
-                // before calling it a failure. ManageExiting keeps retrying the close meanwhile.
-                if (!_exitFailureLogged && (nowUtc - _exitStartUtc).TotalSeconds >= 30 && AnyPositionsOrWorkingOrders())
+                // The 10:14 time exit may still be completing, so give any exit 30s
+                // before calling it a failure. ManageExiting keeps handling the close meanwhile.
+                if (!_flatByLogged && (nowUtc - _exitStartUtc).TotalSeconds >= 30 && AnyPositionsOrWorkingOrders())
                 {
-                    _exitFailureLogged = true;
+                    _flatByLogged = true;
                     _current.AddDetail($"EXIT_FAILURE: legs still open after {FlatBy:hh\\:mm} (30s after {_exitReason})");
                     Log($"EXIT_FAILURE: legs still open after {FlatBy:hh\\:mm}, 30s after {_exitReason}; still flattening at market.",
                         StrategyLoggingLevel.Error);
@@ -1078,7 +1077,7 @@ namespace strategyTesting
             if (!_flatByLogged)
             {
                 _flatByLogged = true;
-                Log($"EXIT_FAILURE: position or working order on a basket symbol at {FlatBy:hh\\:mm} with no basket open; flattening at market.",
+                Log($"EXIT_FAILURE: position or working order on a basket symbol at/after {FlatBy:hh\\:mm} with no basket open; flattening at market.",
                     StrategyLoggingLevel.Error);
             }
             if ((nowUtc - _lastCloseRequestUtc).TotalSeconds >= 5)
@@ -1268,7 +1267,7 @@ namespace strategyTesting
             return string.Join(",", cols);
         }
 
-        private const string DaysHeader = "date,attempts_logged,baskets_traded,daily_net_pnl,cumulative_pnl,day_killed,strategy_killed,note";
+        private const string DaysHeader = "date,attempts_logged,baskets_traded,daily_net_pnl,cumulative_pnl,strategy_killed,note";
 
         private void WriteAttemptRow(AttemptLog log)
         {
@@ -1322,7 +1321,7 @@ namespace strategyTesting
         private void WriteDayRowIfDone(DateTime nowEt)
         {
             if (_dayRowWritten || !IsTradingDay(_dayEt) || nowEt.Date != _dayEt) return;
-            if (nowEt.TimeOfDay < FlatBy || _state != BasketState.Idle || !_attemptHandled.All(h => h)) return;
+            if (_state != BasketState.Idle || !_attemptHandled.All(h => h)) return;
             WriteDayRow("");
         }
 
@@ -1335,7 +1334,7 @@ namespace strategyTesting
                 _attemptsLogged.ToString(CultureInfo.InvariantCulture),
                 _basketsTraded.ToString(CultureInfo.InvariantCulture),
                 Csv(_dailyPnl), Csv(_cumulativePnl),
-                _dayKilled ? "1" : "0", _strategyKilled ? "1" : "0",
+                _strategyKilled ? "1" : "0",
                 CsvText(note)
             });
             Log($"Day {_dayEt:yyyy-MM-dd}: {_attemptsLogged} attempts, {_basketsTraded} baskets, net {_dailyPnl:F2}, " +
@@ -1359,7 +1358,7 @@ namespace strategyTesting
         private void ResetSessionState()
         {
             _cumulativePnl = 0; _strategyKilled = false;
-            _dayEt = DateTime.MinValue; _dailyPnl = 0; _dayKilled = false; _dayRowWritten = false;
+            _dayEt = DateTime.MinValue; _dailyPnl = 0; _dayRowWritten = false;
             _attemptsLogged = 0; _basketsTraded = 0;
             for (int i = 0; i < _attemptHandled.Length; i++) { _attemptHandled[i] = false; _rankingLogged[i] = false; }
         }
