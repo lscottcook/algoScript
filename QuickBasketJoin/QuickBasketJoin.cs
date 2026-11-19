@@ -70,10 +70,10 @@ namespace QuickBasketJoin
 
         // Basket P&L limits, per contract ($). Multiplied by quantity. 0 = off.
         [InputParameter("Basket stop loss per contract ($, 0 = off)", 13, 0, 100000, 1, 2)]
-        public double StopLossPerContract = 250.00;
+        public double StopLossPerContract = 50.00;
 
         [InputParameter("Basket take profit per contract ($, 0 = off)", 14, 0, 100000, 1, 2)]
-        public double TakeProfitPerContract = 250.00;
+        public double TakeProfitPerContract = 50.00;
 
         // Schedule (Eastern time, today). Off = open as soon as the strategy starts / no time exit.
         [InputParameter("Use scheduled open time (off = open on Start)", 15)]
