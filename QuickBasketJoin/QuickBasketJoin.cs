@@ -11,7 +11,9 @@ namespace QuickBasketJoin
 {
     /// <summary>
     /// Manual futures basket: MES, MNQ, MGC, MCL, MHG. Pick Buy / Sell / Off for each symbol, then
-    /// click Start: one basket opens right away at market, QtyPerLeg contracts per leg.
+    /// click Start: one basket opens at market, QtyPerLeg contracts per leg - right away, or at the
+    /// scheduled open time (ET, today) if one is set. An optional scheduled close time (ET, today)
+    /// flattens the basket (TIME_EXIT).
     ///
     /// Legs whose bid/ask is fresh and spread normal are sent immediately; any other leg waits and
     /// joins when its quote is good, up to 5 minutes after start, else it is dropped. An on-time leg
@@ -73,28 +75,41 @@ namespace QuickBasketJoin
         [InputParameter("Basket take profit per contract ($, 0 = off)", 14, 0, 100000, 1, 2)]
         public double TakeProfitPerContract = 250.00;
 
+        // Schedule (Eastern time, today). Off = open as soon as the strategy starts / no time exit.
+        [InputParameter("Use scheduled open time (off = open on Start)", 15)]
+        public bool UseScheduledOpen = false;
+
+        [InputParameter("Open time (ET, HH:mm or HH:mm:ss)", 16)]
+        public string OpenTimeText = "09:30";
+
+        [InputParameter("Use scheduled close time", 17)]
+        public bool UseScheduledClose = false;
+
+        [InputParameter("Close time (ET, HH:mm or HH:mm:ss)", 18)]
+        public string CloseTimeText = "10:14";
+
         // Fees: per side, per contract, all-in. Defaults are the AMP Futures estimate.
         // On = P&L, stop and target use these; off = use the fee the broker reports on each fill.
         // Both are logged either way (fees_broker / fees_estimated).
-        [InputParameter("Use estimated fees below (off = broker-reported fees)", 15)]
+        [InputParameter("Use estimated fees below (off = broker-reported fees)", 19)]
         public bool UseFeeEstimates = true;
 
-        [InputParameter("MES fee per side ($)", 16, 0, 100, 0.01, 2)]
+        [InputParameter("MES fee per side ($)", 20, 0, 100, 0.01, 2)]
         public double FeeMes = 0.60;
 
-        [InputParameter("MNQ fee per side ($)", 17, 0, 100, 0.01, 2)]
+        [InputParameter("MNQ fee per side ($)", 21, 0, 100, 0.01, 2)]
         public double FeeMnq = 0.60;
 
-        [InputParameter("MGC fee per side ($)", 18, 0, 100, 0.01, 2)]
+        [InputParameter("MGC fee per side ($)", 22, 0, 100, 0.01, 2)]
         public double FeeMgc = 0.85;
 
-        [InputParameter("MCL fee per side ($)", 19, 0, 100, 0.01, 2)]
+        [InputParameter("MCL fee per side ($)", 23, 0, 100, 0.01, 2)]
         public double FeeMcl = 0.75;
 
-        [InputParameter("MHG fee per side ($)", 20, 0, 100, 0.01, 2)]
+        [InputParameter("MHG fee per side ($)", 24, 0, 100, 0.01, 2)]
         public double FeeMhg = 0.80;
 
-        [InputParameter("Starting Balance", 21)]
+        [InputParameter("Starting Balance", 25)]
         public double StartingBalance { get; set; }
 
         // ------------------------------------------------------------------
@@ -194,7 +209,7 @@ namespace QuickBasketJoin
             }
         }
 
-        private enum BasketState { WaitingForQuotes, Entering, InBasket, Exiting, Done }
+        private enum BasketState { WaitingForOpenTime, WaitingForQuotes, Entering, InBasket, Exiting, Done }
 
         // ------------------------------------------------------------------
         // State
@@ -210,6 +225,8 @@ namespace QuickBasketJoin
         private BasketLog _current;
         private DateTime _startUtc, _enterStartUtc, _exitStartUtc, _lastCloseRequestUtc = DateTime.MinValue, _flatSinceUtc;
         private DateTime _lastMinuteEvaluatedEt = DateTime.MinValue;
+        // Scheduled open / close, Eastern time; MinValue = not scheduled.
+        private DateTime _openAtEt = DateTime.MinValue, _closeAtEt = DateTime.MinValue;
         private string _exitReason = "";
         private bool _exitSlowLogged;
 
@@ -307,16 +324,50 @@ namespace QuickBasketJoin
                     tickOk ? StrategyLoggingLevel.Info : StrategyLoggingLevel.Error);
             }
 
-            // Pre-entry checks, before any order is sent.
-            if (!Core.Instance.Connections.All.Any(c => c.State == ConnectionState.Connected))
+            // Schedule: both times are today, Eastern time, and must still be ahead.
+            DateTime runEt = ToEastern(DateTime.UtcNow);
+            _openAtEt = _closeAtEt = DateTime.MinValue;
+            if (UseScheduledOpen)
             {
-                Log("Not connected: no basket opened.", StrategyLoggingLevel.Error);
-                return;
+                if (!TryParseTimeOfDay(OpenTimeText, out TimeSpan openTod))
+                {
+                    Log($"Open time '{OpenTimeText}' is not a valid time; use HH:mm or HH:mm:ss (24-hour, ET).", StrategyLoggingLevel.Error);
+                    return;
+                }
+                _openAtEt = runEt.Date + openTod;
+                if (_openAtEt <= runEt)
+                {
+                    Log($"Open time {_openAtEt:HH:mm:ss} ET has already passed (now {runEt:HH:mm:ss} ET): no basket opened.",
+                        StrategyLoggingLevel.Error);
+                    return;
+                }
             }
-            if (AnyPositionsOrWorkingOrders())
+            if (UseScheduledClose)
             {
-                Log("A position or working order already exists on a basket symbol in this account: no basket opened. " +
-                    "Flatten those symbols and start again.", StrategyLoggingLevel.Error);
+                if (!TryParseTimeOfDay(CloseTimeText, out TimeSpan closeTod))
+                {
+                    Log($"Close time '{CloseTimeText}' is not a valid time; use HH:mm or HH:mm:ss (24-hour, ET).", StrategyLoggingLevel.Error);
+                    return;
+                }
+                _closeAtEt = runEt.Date + closeTod;
+                if (_closeAtEt <= runEt)
+                {
+                    Log($"Close time {_closeAtEt:HH:mm:ss} ET has already passed (now {runEt:HH:mm:ss} ET): no basket opened.",
+                        StrategyLoggingLevel.Error);
+                    return;
+                }
+                if (_openAtEt != DateTime.MinValue && _closeAtEt <= _openAtEt)
+                {
+                    Log($"Close time {_closeAtEt:HH:mm:ss} must be after the open time {_openAtEt:HH:mm:ss} (ET).", StrategyLoggingLevel.Error);
+                    return;
+                }
+            }
+
+            // Pre-entry checks, before any order is sent (repeated at the open time when scheduled).
+            string block = PreEntryBlock();
+            if (block.Length > 0)
+            {
+                Log($"{block}: no basket opened.", StrategyLoggingLevel.Error);
                 return;
             }
 
@@ -358,7 +409,7 @@ namespace QuickBasketJoin
                         UseEstimatedFees = UseFeeEstimates
                     });
                 }
-                _state = BasketState.WaitingForQuotes;
+                _state = _openAtEt != DateTime.MinValue ? BasketState.WaitingForOpenTime : BasketState.WaitingForQuotes;
             }
 
             _ready = true;
@@ -371,7 +422,9 @@ namespace QuickBasketJoin
                 $", {QtyPerLeg} per leg, entry MARKET. Pre-send check: bid/ask under {QuoteMaxAgeSeconds}s old and spread <= {MaxSpreadTicks} ticks; " +
                 $"late join up to {LateJoinMinutes} min, fill timeout {EntryFillTimeoutMinutes} min. " +
                 $"Stop loss {(MaxLossPerBasket > 0 ? $"-${MaxLossPerBasket:F2} (after {CapActiveAfterMinutes} min)" : "off")}, " +
-                $"take profit {(TakeProfitPerBasket > 0 ? $"+${TakeProfitPerBasket:F2}" : "off")}, checked every second." +
+                $"take profit {(TakeProfitPerBasket > 0 ? $"+${TakeProfitPerBasket:F2}" : "off")}, checked every second. " +
+                $"Open {(_openAtEt != DateTime.MinValue ? $"at {_openAtEt:HH:mm:ss} ET" : "now")}, " +
+                $"close {(_closeAtEt != DateTime.MinValue ? $"at {_closeAtEt:HH:mm:ss} ET" : "by stop / target / hand only")}. " +
                 $"P&L uses {(UseFeeEstimates ? "ESTIMATED fees (inputs)" : "BROKER-reported fees")}. Log: {_basketsCsv}.",
                 StrategyLoggingLevel.Info);
         }
@@ -419,6 +472,12 @@ namespace QuickBasketJoin
                 // Stopping is a deliberate user action: allow symbols that hit the refusal limit one
                 // more try, but keep waiting on closes the broker already accepted.
                 ResetCloseTracking(keepAccepted: true);
+                if (_state == BasketState.WaitingForOpenTime)
+                {
+                    // Nothing sent and nothing to flatten; leave any other positions alone.
+                    AbortBeforeEntry("STOPPED", "strategy stopped before the scheduled open time");
+                    return;
+                }
                 if (_state == BasketState.WaitingForQuotes)
                 {
                     // Nothing was sent yet.
@@ -543,8 +602,18 @@ namespace QuickBasketJoin
         private void Step(DateTime nowUtc)
         {
             DateTime nowEt = ToEastern(nowUtc);
+
+            // Scheduled close: flatten whatever is open or being opened.
+            if (_closeAtEt != DateTime.MinValue && nowEt >= _closeAtEt
+                && (_state == BasketState.WaitingForQuotes || _state == BasketState.Entering || _state == BasketState.InBasket))
+            {
+                BeginExit("TIME_EXIT", $"close time {_closeAtEt:HH:mm:ss} ET, basket P&L {Fmt(BasketPnl(_current))}", nowUtc, nowEt);
+                return;
+            }
+
             switch (_state)
             {
+                case BasketState.WaitingForOpenTime: OpenAtScheduledTime(nowUtc, nowEt); break;
                 case BasketState.WaitingForQuotes: TryOpenBasket(nowUtc, nowEt); break;
                 case BasketState.Entering: ManageEntering(nowUtc, nowEt); break;
                 case BasketState.InBasket: ManageInBasket(nowUtc, nowEt); break;
@@ -555,6 +624,44 @@ namespace QuickBasketJoin
         // ------------------------------------------------------------------
         // Entry
         // ------------------------------------------------------------------
+
+        // At the scheduled open time: re-run the pre-entry checks, then open as if Start was just clicked.
+        private void OpenAtScheduledTime(DateTime nowUtc, DateTime nowEt)
+        {
+            if (nowEt < _openAtEt) return;
+            string block = PreEntryBlock();
+            if (block.Length > 0)
+            {
+                AbortBeforeEntry("NO_BASKET", $"not entered at the scheduled open time {_openAtEt:HH:mm:ss} ET: {block}");
+                return;
+            }
+            Log($"Scheduled open time {_openAtEt:HH:mm:ss} ET reached: opening basket.", StrategyLoggingLevel.Trading);
+            _startUtc = nowUtc;
+            _state = BasketState.WaitingForQuotes;
+            TryOpenBasket(nowUtc, nowEt);
+        }
+
+        // "" if a basket can be opened now, else the reason it can't.
+        private string PreEntryBlock()
+        {
+            if (CurrentAccount == null) return "No account";
+            if (!Core.Instance.Connections.All.Any(c => c.State == ConnectionState.Connected)) return "Not connected";
+            if (AnyPositionsOrWorkingOrders())
+                return "A position or working order already exists on a basket symbol in this account (flatten those symbols and start again)";
+            return "";
+        }
+
+        // Ends the run before any order was sent: logs a CSV row, touches no positions.
+        private void AbortBeforeEntry(string reason, string detail)
+        {
+            BasketLog log = _current;
+            _exitReason = reason;
+            log.ExitEt = ToEastern(DateTime.UtcNow);
+            log.AddDetail(detail);
+            foreach (Leg leg in log.Legs) leg.Dropped = true;
+            Log($"{reason} - {detail}. No orders were sent.", StrategyLoggingLevel.Trading);
+            FinishBasket();
+        }
 
         // Sends the entry once every leg has a good quote, or StartQuoteWaitSeconds after Start,
         // whichever comes first. Legs without a good quote by then join late.
@@ -1057,7 +1164,7 @@ namespace QuickBasketJoin
             cols.AddRange(SymbolSpecs.Select(s => "entry_fill_" + s.Key));
             cols.AddRange(SymbolSpecs.Select(s => "touch_at_send_" + s.Key));
             cols.AddRange(SymbolSpecs.Select(s => "touch_slippage_ticks_" + s.Key));
-            cols.AddRange(new[] { "quantity", "stop_loss", "take_profit", "basket_filled_time", "exit_time" });
+            cols.AddRange(new[] { "quantity", "stop_loss", "take_profit", "scheduled_open", "scheduled_close", "basket_filled_time", "exit_time" });
             cols.AddRange(SymbolSpecs.Select(s => "exit_price_" + s.Key));
             cols.AddRange(new[] { "exit_price_estimated", "gross_pnl", "fees", "net_pnl", "fee_source", "fees_broker", "fees_estimated" });
             cols.AddRange(SymbolSpecs.Select(s => "leg_pnl_" + s.Key));
@@ -1085,6 +1192,8 @@ namespace QuickBasketJoin
             v.Add(QtyPerLeg.ToString(CultureInfo.InvariantCulture));
             v.Add(MaxLossPerBasket > 0 ? Csv(-MaxLossPerBasket) : "");
             v.Add(TakeProfitPerBasket > 0 ? Csv(TakeProfitPerBasket) : "");
+            v.Add(CsvTime(_openAtEt));
+            v.Add(CsvTime(_closeAtEt));
             v.Add(CsvTime(log.FilledEt));
             v.Add(CsvTime(log.ExitEt));
             foreach (var s in SymbolSpecs)
@@ -1297,6 +1406,16 @@ namespace QuickBasketJoin
                 : utc.Kind == DateTimeKind.Unspecified ? DateTime.SpecifyKind(utc, DateTimeKind.Utc)
                 : utc.ToUniversalTime();
             return TimeZoneInfo.ConvertTimeFromUtc(normalized, Eastern);
+        }
+
+        // 24-hour time of day: H:mm, HH:mm, H:mm:ss or HH:mm:ss.
+        private static bool TryParseTimeOfDay(string text, out TimeSpan t)
+        {
+            t = default;
+            if (string.IsNullOrWhiteSpace(text)) return false;
+            string[] formats = { @"h\:mm", @"hh\:mm", @"h\:mm\:ss", @"hh\:mm\:ss" };
+            return TimeSpan.TryParseExact(text.Trim(), formats, CultureInfo.InvariantCulture, out t)
+                && t >= TimeSpan.Zero && t < TimeSpan.FromDays(1);
         }
 
         private static DateTime TruncateMinute(DateTime t)
